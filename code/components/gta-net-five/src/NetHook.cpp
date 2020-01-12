@@ -14,8 +14,12 @@
 
 #include <MinHook.h>
 
+#include <GameInit.h>
+
 #include <scrEngine.h>
 #include <ScriptEngine.h>
+
+#include <CoreConsole.h>
 
 #include <Error.h>
 
@@ -186,32 +190,17 @@ bool GetOurSystemKey(char* systemKey);
 #pragma comment(lib, "winmm.lib")
 
 #include <strsafe.h>
-
-struct ScInAddr
-{
-	uint64_t unkKey1;
-	uint64_t unkKey2;
-	uint32_t secKeyTime; // added in 393
-	uint32_t ipLan;
-	uint16_t portLan;
-	uint32_t ipUnk;
-	uint16_t portUnk;
-	uint32_t ipOnline;
-	uint16_t portOnline;
-	uint16_t pad3;
-	uint32_t newVal; // added in 372
-	uint64_t rockstarAccountId; // 463/505 addition - really R*? given this field one could easily replace everything with a Steam-like implementation only passing around user IDs...
-};
+#include <NetworkPlayerMgr.h>
 
 struct ScSessionAddr
 {
 	uint8_t sessionId[16];
-	ScInAddr addr;
+	netPeerAddress addr;
 };
 
 struct ScUnkAddr
 {
-	ScInAddr lanAddr; // ???
+	netPeerAddress lanAddr; // ???
 	uint64_t pad;
 	ScSessionAddr addr;
 	uint32_t unkVal;
@@ -219,7 +208,7 @@ struct ScUnkAddr
 	char systemKey[16];
 };
 
-static_assert(sizeof(ScInAddr) == (40 + 8 + 8), "ScInAddr size seems bad...");
+static_assert(sizeof(netPeerAddress) == (40 + 8 + 8), "ScInAddr size seems bad...");
 static_assert(sizeof(ScSessionAddr) == (56 + 8 + 8), "ScSessionAddr size seems bad...");
 
 bool StartLookUpInAddr(void*, void*, void* us, int* unkInt, bool something, int* a, ScSessionAddr* in, void*, ScUnkAddr* out, int* outSuccess, int* outStatus) // out might be the one before, or even same as in, dunno
@@ -249,7 +238,7 @@ void MigrateSessionCopy(char* target, char* source)
 	
 	std::unique_ptr<NetBuffer> msgBuffer(new NetBuffer(64));
 
-	msgBuffer->Write<uint32_t>((sessionAddress->addr.ipLan & 0xFFFF) ^ 0xFEED);
+	msgBuffer->Write<uint32_t>((sessionAddress->addr.localAddr.ip.addr & 0xFFFF) ^ 0xFEED);
 	msgBuffer->Write<uint32_t>(sessionAddress->addr.unkKey1);
 
 	g_netLibrary->SendReliableCommand("msgHeHost", msgBuffer->GetBuffer(), msgBuffer->GetCurLength());
@@ -334,6 +323,11 @@ OnlineAddress* GetOurOnlineAddressRaw()
 static hook::cdecl_stub<bool()> isSessionStarted([] ()
 {
 	return hook::pattern("74 0E 83 B9 ? ? 00 00 ? 75 05 B8 01").count(1).get(0).get<void>(-12);
+});
+
+static hook::cdecl_stub<void(int reason, int, int, int, bool)> networkBail([]()
+{
+	return hook::get_pattern("41 8B F1 41 8B E8 8B FA 8B D9 74 26", -0x1B);
 });
 
 static bool(*_isScWaitingForInit)();
@@ -422,14 +416,14 @@ struct
 			netAddr.addr.unkKey1 = g_netLibrary->GetHostBase();
 			netAddr.addr.unkKey2 = g_netLibrary->GetHostBase();
 
-			netAddr.addr.ipLan = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portLan = 6672;
+			netAddr.addr.localAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.localAddr.port = 6672;
 
-			netAddr.addr.ipUnk = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portUnk = 6672;
+			netAddr.addr.relayAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.relayAddr.port = 6672;
 
-			netAddr.addr.ipOnline = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portOnline = 6672;
+			netAddr.addr.publicAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.publicAddr.port = 6672;
 
 			*(uint32_t*)&netAddr.sessionId[0] = 0x2;//g_netLibrary->GetHostBase() ^ 0xFEAFEDE;
 			*(uint32_t*)&netAddr.sessionId[8] = 0xCDCDCDCD;
@@ -574,6 +568,39 @@ struct
 				state = HS_IDLE;
 			}
 		}
+		else if (state == HS_HOSTED || state == HS_JOINED)
+		{
+			int playerCount = 0;
+
+			for (int i = 0; i < 256; i++)
+			{
+				// NETWORK_IS_PLAYER_ACTIVE
+				if (NativeInvoke::Invoke<0xB8DFD30D6973E135, bool>(i))
+				{
+					++playerCount;
+				}
+			}
+
+			if (isNetworkHost() && playerCount == 1 && !cgi->OneSyncEnabled && g_netLibrary->GetHostNetID() != g_netLibrary->GetServerNetID())
+			{
+				state = HS_MISMATCH;
+			}
+		}
+		else if (state == HS_MISMATCH)
+		{
+			cgi->ClearVariable("networkInited");
+
+			networkBail(7, -1, -1, -1, true);
+
+			state = HS_DISCONNECTING;
+		}
+		else if (state == HS_DISCONNECTING)
+		{
+			if (!isSessionStarted())
+			{
+				state = HS_LOADED;
+			}
+		}
 	}
 } hostSystem;
 
@@ -618,6 +645,13 @@ void MumbleVoice_BindNetLibrary(NetLibrary*);
 void ObjectIds_BindNetLibrary(NetLibrary*);
 
 #include <CloneManager.h>
+
+static hook::cdecl_stub<void(rlGamerInfo*)> _setGameGamerInfo([]()
+{
+	return hook::get_pattern("3A D8 0F 95 C3 40 0A DE 40", -0x53);
+});
+
+static rlGamerInfo** g_gamerInfo;
 
 static HookFunction initFunction([]()
 {
@@ -682,11 +716,37 @@ static HookFunction initFunction([]()
 
 	g_netLibrary->SetBase(GetTickCount());
 
+	g_gamerInfo = hook::get_address<decltype(g_gamerInfo)>(hook::get_pattern("FF C8 0F 85 AC 00 00 00 48 39 35", 11));
+
 	static bool doTickThisFrame = false;
 
 	OnGameFrame.Connect([]()
 	{
 		GetOurOnlineAddressRaw();
+
+		if (!*g_gamerInfo)
+		{
+			return;
+		}
+
+		static auto origNonce = (*g_gamerInfo)->gamerId;
+		uint64_t tgtNonce;
+
+		if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+		{
+			tgtNonce = g_netLibrary->GetServerNetID();
+		}
+		else
+		{
+			tgtNonce = origNonce;
+		}
+
+		if ((*g_gamerInfo)->gamerId != tgtNonce)
+		{
+			(*g_gamerInfo)->gamerId = tgtNonce;
+
+			_setGameGamerInfo(*g_gamerInfo);
+		}
 	});
 
 	OnCriticalGameFrame.Connect([]()
@@ -738,6 +798,11 @@ static HookFunction initFunction([]()
 			Instance<ICoreGameInit>::Get()->OnGameFinalizeLoad.Connect([] ()
 			{
 				gameLoaded = true;
+			});
+
+			OnKillNetwork.Connect([](const char*)
+			{
+				gameLoaded = false;
 			});
 
 			eventConnected = true;
@@ -853,18 +918,18 @@ static void GetOurSecurityKey(uint64_t* key)
 	//key[1] = 0;
 }
 
-bool GetOurOnlineAddress(ScInAddr* address)
+bool GetOurOnlineAddress(netPeerAddress* address)
 {
 	memset(address, 0, sizeof(*address));
 	address->secKeyTime = g_netLibrary->GetServerBase() ^ 0xABCD;
 	address->unkKey1 = g_netLibrary->GetServerBase();
 	address->unkKey2 = g_netLibrary->GetServerBase();
-	address->ipLan = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portLan = 6672;
-	address->ipUnk = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portUnk = 6672;
-	address->ipOnline = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portOnline = 6672;
+	address->localAddr.ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->localAddr.port = 6672;
+	address->relayAddr.ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->relayAddr.port = 6672;
+	address->publicAddr.ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->publicAddr.port = 6672;
 	//address->pad5 = 0x19;
 
 	g_globalNetSecurityKey[0] = g_netLibrary->GetServerBase();
@@ -1275,11 +1340,13 @@ void RunNetworkStuff()
 	}*/
 }
 
+static std::string g_quitMsg;
+
 static void WINAPI ExitProcessReplacement(UINT exitCode)
 {
 	if (g_netLibrary)
 	{
-		g_netLibrary->Disconnect("Exiting");
+		g_netLibrary->Disconnect((g_quitMsg.empty()) ? "Exiting" : g_quitMsg.c_str());
 		g_netLibrary->FinalizeDisconnect();
 	}
 
@@ -1295,10 +1362,10 @@ static void WaitForScAndLoadMeta(const char* fn, bool a2, uint32_t a3)
 		// 1365
 		// 1493
 		// 1604
-		((void(*)())0x1400067E8)();
-		((void(*)())0x1407D1960)();
-		((void(*)())0x140025F7C)();
-		((void(*)(void*))0x141595FD4)((void*)0x142DC9BA0); // rly? renderthreadinterface stuff
+		((void(*)())hook::get_adjusted(0x1400067E8))();
+		((void(*)())hook::get_adjusted(0x1407D1960))();
+		((void(*)())hook::get_adjusted(0x140025F7C))();
+		((void(*)(void*))hook::get_adjusted(0x141595FD4))((void*)hook::get_adjusted(0x142DC9BA0)); // rly? renderthreadinterface stuff
 
 		Sleep(0);
 	}
@@ -1308,6 +1375,12 @@ static void WaitForScAndLoadMeta(const char* fn, bool a2, uint32_t a3)
 
 static HookFunction hookFunction([] ()
 {
+	static ConsoleCommand quitCommand("quit", [](const std::string& message)
+	{
+		g_quitMsg = message;
+		ExitProcess(-1);
+	});
+
 	/*OnPostFrontendRender.Connect([] ()
 	{
 		int value = *(int*)getNetworkManager();
@@ -1756,7 +1829,8 @@ static HookFunction hookFunction([] ()
 
 	// network timeout
 	{
-		*hook::get_address<int*>(hook::get_pattern("BA 2B 2F A8 09 48 8B CF E8", 0x1B)) *= 2.5f;
+		// ADD THIS BACK
+		//*hook::get_address<int*>(hook::get_pattern("BA 2B 2F A8 09 48 8B CF E8", 0x1B)) *= 2.5f;
 	}
 
 	// find autoid descriptors
@@ -1782,7 +1856,7 @@ static HookFunction hookFunction([] ()
 
 		if (locator->signature == 1)
 		{
-			char* namePtr = (char*)(0x140000000 + locator->pTypeDescriptor + 16);
+			char* namePtr = (char*)(hook::get_adjusted(0x140000000) + locator->pTypeDescriptor + 16);
 
 			if (strcmp(namePtr, ".?AV?$AutoIdDescriptor_T@VnetMessage@rage@@@rage@@") == 0)
 			{
@@ -1843,4 +1917,14 @@ static HookFunction hookFunction([] ()
 		hook::set_call(&_origLoadMeta, location);
 		hook::call(location, WaitForScAndLoadMeta);
 	}
+
+	// default netnoupnp and netnopcp to true
+	auto netNoUpnp = hook::get_address<int*>(hook::get_pattern("8A D1 76 02 B2 01 48 39 0D", 9));
+	auto netNoPcp = hook::get_address<int*>(hook::get_pattern("8A D1 EB 02 B2 01 48 39 0D", 9));
+
+	OnGameFrame.Connect([netNoPcp, netNoUpnp]()
+	{
+		*netNoUpnp = TRUE;
+		*netNoPcp = TRUE;
+	});
 });

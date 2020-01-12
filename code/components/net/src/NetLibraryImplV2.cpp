@@ -26,6 +26,8 @@ public:
 
 	virtual void SendReliableCommand(uint32_t type, const char* buffer, size_t length) override;
 
+	virtual void SendUnreliableCommand(uint32_t type, const char* buffer, size_t length) override;
+
 	virtual bool HasTimedOut() override;
 
 	virtual void Reset() override;
@@ -34,8 +36,10 @@ public:
 
 	virtual void SendConnect(const std::string& connectData) override;
 
+	virtual bool IsDisconnected() override;
+
 private:
-	void ProcessPacket(const uint8_t* data, size_t size);
+	void ProcessPacket(const uint8_t* data, size_t size, NetPacketMetrics& metrics, ENetPacketFlag flags);
 
 private:
 	std::string m_connectData;
@@ -52,6 +56,9 @@ private:
 
 	uint32_t m_lastKeepaliveSent;
 };
+
+static int g_maxMtu = 1300;
+static std::shared_ptr<ConVar<int>> g_maxMtuVar;
 
 NetLibraryImplV2::NetLibraryImplV2(INetLibraryInherit* base)
 	: m_base(base), m_host(nullptr), m_timedOut(false), m_serverPeer(nullptr), m_lastKeepaliveSent(0)
@@ -95,6 +102,13 @@ void NetLibraryImplV2::CreateResources()
 
 		return 0;
 	};
+
+	m_host->mtu = g_maxMtu;
+
+	for (int peer = 0; peer < m_host->peerCount; peer++)
+	{
+		m_host->peers[peer].mtu = g_maxMtu;
+	}
 }
 
 void NetLibraryImplV2::SendReliableCommand(uint32_t type, const char* buffer, size_t length)
@@ -110,7 +124,23 @@ void NetLibraryImplV2::SendReliableCommand(uint32_t type, const char* buffer, si
 		enet_peer_send(m_serverPeer, 0, packet);
 	}
 
-	m_base->GetMetricSink()->OnOutgoingCommand(type, length);
+	m_base->GetMetricSink()->OnOutgoingCommand(type, length, true);
+}
+
+void NetLibraryImplV2::SendUnreliableCommand(uint32_t type, const char* buffer, size_t length)
+{
+	NetBuffer msg(131072);
+	msg.Write(type);
+	msg.Write(buffer, length);
+
+	if (!m_timedOut && m_serverPeer)
+	{
+		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), (ENetPacketFlag)0);
+
+		enet_peer_send(m_serverPeer, 0, packet);
+	}
+
+	m_base->GetMetricSink()->OnOutgoingCommand(type, length, false);
 }
 
 void NetLibraryImplV2::SendData(const NetAddress& netAddress, const char* data, size_t length)
@@ -127,6 +157,11 @@ void NetLibraryImplV2::SendData(const NetAddress& netAddress, const char* data, 
 bool NetLibraryImplV2::HasTimedOut()
 {
 	return m_timedOut;
+}
+
+bool NetLibraryImplV2::IsDisconnected()
+{
+	return !m_serverPeer;
 }
 
 void NetLibraryImplV2::Reset()
@@ -147,6 +182,7 @@ void NetLibraryImplV2::Flush()
 void NetLibraryImplV2::RunFrame()
 {
 	uint32_t inDataSize = 0;
+	NetPacketMetrics inMetrics;
 
 	ENetEvent event;
 
@@ -166,7 +202,7 @@ void NetLibraryImplV2::RunFrame()
 		}
 		case ENET_EVENT_TYPE_RECEIVE:
 		{
-			ProcessPacket(event.packet->data, event.packet->dataLength);
+			ProcessPacket(event.packet->data, event.packet->dataLength, inMetrics, (ENetPacketFlag)event.packet->flags);
 			inDataSize += event.packet->dataLength;
 
 			enet_packet_destroy(event.packet);
@@ -174,8 +210,19 @@ void NetLibraryImplV2::RunFrame()
 			break;
 		}
 		case ENET_EVENT_TYPE_DISCONNECT:
-			m_timedOut = true;
+		{
+			if (Instance<ICoreGameInit>::Get()->NetProtoVersion >= 0x201902101056)
+			{
+				m_serverPeer = nullptr;
+			}
+			else
+			{
+				m_timedOut = true;
+			}
+
+			//m_timedOut = true;
 			break;
+		}
 		}
 	}
 
@@ -196,7 +243,7 @@ void NetLibraryImplV2::RunFrame()
 
 			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), ENET_PACKET_FLAG_UNSEQUENCED));
 
-			m_base->GetMetricSink()->OnOutgoingCommand(0xE938445B, packet.payload.size() + 4);
+			m_base->GetMetricSink()->OnOutgoingCommand(0xE938445B, packet.payload.size() + 4, false);
 			m_base->GetMetricSink()->OnOutgoingRoutePackets(1);
 		}
 
@@ -216,18 +263,18 @@ void NetLibraryImplV2::RunFrame()
 		// update received metrics
 		if (m_host->totalReceivedData != 0)
 		{
-			for (uint32_t i = 0; i < m_host->totalReceivedPackets; ++i)
+			// actually: overhead
+			inMetrics.AddElementSize(NET_PACKET_SUB_OVERHEAD, m_host->totalReceivedData - inDataSize);
+
+			m_base->GetMetricSink()->OnIncomingPacket(inMetrics);
+
+			m_host->totalReceivedData = 0;
+			inDataSize = 0;
+
+			for (uint32_t i = 1; i < m_host->totalReceivedPackets; ++i)
 			{
 				NetPacketMetrics m;
-				m.AddElementSize(NET_PACKET_SUB_MISC, inDataSize);
-
-				// actually: overhead
-				m.AddElementSize(NET_PACKET_SUB_RELIABLES, m_host->totalReceivedData - inDataSize);
-
 				m_base->GetMetricSink()->OnIncomingPacket(m);
-
-				m_host->totalReceivedData = 0;
-				inDataSize = 0;
 			}
 
 			m_base->AddReceiveTick();
@@ -265,11 +312,11 @@ void NetLibraryImplV2::SendConnect(const std::string& connectData)
 	m_serverPeer = enet_host_connect(m_host, &addr, 2, 0);
 
 #ifdef _DEBUG
-	enet_peer_timeout(m_serverPeer, 86400 * 1000, 86400 * 1000, 86400 * 1000);
+	//enet_peer_timeout(m_serverPeer, 86400 * 1000, 86400 * 1000, 86400 * 1000);
 #endif
 }
 
-void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size)
+void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size, NetPacketMetrics& metrics, ENetPacketFlag flags)
 {
 	NetBuffer msg((char*)data, size);
 	uint32_t msgType = msg.Read<uint32_t>();
@@ -330,9 +377,9 @@ void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size)
 		return;
 	}
 
-	m_base->GetMetricSink()->OnIncomingCommand(msgType, size);
+	m_base->GetMetricSink()->OnIncomingCommand(msgType, size, (flags & ENET_PACKET_FLAG_RELIABLE) != 0);
 
-	if (msgType == 0xE938445B) // 'msgRoute'
+	if (msgType == HashRageString("msgRoute")) // 'msgRoute'
 	{
 		uint16_t netID = msg.Read<uint16_t>();
 		uint16_t rlength = msg.Read<uint16_t>();
@@ -349,9 +396,26 @@ void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size)
 
 		// add to metrics
 		m_base->GetMetricSink()->OnIncomingRoutePackets(1);
+
+		// add as routed message
+		metrics.AddElementSize(NET_PACKET_SUB_ROUTED_MESSAGES, size);
 	}
-	else if (msgType != 0xCA569E63) // reliable command
+	else if (msgType != HashRageString("msgEnd")) // reliable command
 	{
+		auto subType = NET_PACKET_SUB_MISC;
+
+		// cloning data is considered routing
+		if (msgType == HashRageString("msgPackedAcks") || msgType == HashRageString("msgPackedClones"))
+		{
+			subType = NET_PACKET_SUB_ROUTED_MESSAGES;
+		}
+		else if (flags & ENET_PACKET_FLAG_RELIABLE)
+		{
+			subType = NET_PACKET_SUB_RELIABLES;
+		}
+
+		metrics.AddElementSize(subType, size);
+
 		size_t reliableSize = size - 4;
 
 		std::vector<char> reliableBuf(reliableSize);
@@ -369,6 +433,12 @@ void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size)
 static InitFunction initFunction([]()
 {
 	enet_initialize();
+
+	NetLibrary::OnNetLibraryCreate.Connect([](NetLibrary*)
+	{
+		g_maxMtuVar = std::make_shared<ConVar<int>>("net_maxMtu", ConVar_Archive, 1300, &g_maxMtu);
+		g_maxMtuVar->GetHelper()->SetConstraints(ENET_PROTOCOL_MINIMUM_MTU, ENET_PROTOCOL_MAXIMUM_MTU);
+	});
 });
 
 std::unique_ptr<NetLibraryImplBase> CreateNetLibraryImplV2(INetLibraryInherit* base)

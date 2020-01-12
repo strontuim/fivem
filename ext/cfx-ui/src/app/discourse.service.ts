@@ -1,7 +1,11 @@
 import { Injectable, EventEmitter } from '@angular/core';
+import { Server } from './servers/server';
+import { ServersService } from './servers/servers.service';
 
 import * as forge from 'node-forge';
 import * as query from 'query-string';
+import { BehaviorSubject } from 'rxjs';
+import { GameService } from './game.service';
 
 class RSAKeyCollection {
     public: string;
@@ -16,6 +20,14 @@ const randomBytes = function(length) {
         });
 };
 
+
+export class BoostData {
+    power: number;
+    source: string;
+    server: Server;
+    address: string;
+}
+
 @Injectable()
 export class DiscourseService {
     private static BASE_URL = 'https://forum.fivem.net';
@@ -24,28 +36,81 @@ export class DiscourseService {
     private clientId: string;
     private nonce: string;
 
+    private ownershipTicket: string;
+
     private authToken: string;
     private computerName = 'UNKNOWN';
 
     public messageEvent = new EventEmitter<string>();
-    public signinChange = new EventEmitter<any>();
+    public signinChange = new BehaviorSubject<any>(null);
 
     public currentUser: any;
 
-    public constructor() {
+    public currentBoost: BoostData;
+    public noCurrentBoost = false;
+
+    public constructor(private serversService: ServersService, private gameService: GameService) {
         this.authToken = window.localStorage.getItem('discourseAuthToken');
 
         if (this.authToken && this.authToken.length > 0) {
             this.getCurrentUser().then(user => {
-                this.signinChange.emit(user);
+                this.signinChange.next(user);
 
                 this.currentUser = user;
             });
         }
+
+        this.signinChange.subscribe(user => {
+            this.externalCall('https://servers-frontend.fivem.net/api/upvote/', 'GET').then(result => {
+                if (result.status < 400) {
+                    this.currentBoost = {
+                        address: result.data.address,
+                        power: result.data.power,
+                        source: result.data.source,
+                        server: null
+                    };
+
+                    this.noCurrentBoost = false;
+
+                    this.serversService
+                        .getReplayedServers()
+                        .filter(server => server != null && server.address === result.data.address)
+                        .subscribe(a => {
+                            this.currentBoost.server = a;
+                        });
+                } else if (result.status === 404) {
+                    this.noCurrentBoost = true;
+                }
+            });
+        });
+
+		this.signinChange.subscribe(identity => {
+			this.gameService.setDiscourseIdentity(this.getToken(), this.getExtClientId());
+		});
+
+		this.messageEvent.subscribe((msg: string) => {
+			this.gameService.invokeInformational(msg);
+        });
+
+        this.gameService.computerNameChange.subscribe((data: string) => {
+            this.setComputerName(data);
+        });
+
+        this.gameService.ownershipTicketChange.subscribe((ticket: string) => {
+            this.setOwnershipTicket(ticket);
+        });
+
+        this.gameService.authPayloadSet.subscribe((payload: string) => {
+            this.handleAuthPayload(payload);
+        })
     }
 
-    public setComputerName(computerName: string) {
+    private setComputerName(computerName: string) {
         this.computerName = computerName;
+    }
+
+    private setOwnershipTicket(ticket: string) {
+        this.ownershipTicket = ticket;
     }
 
     public async apiCall(path: string, method?: string, data?: any) {
@@ -80,7 +145,7 @@ export class DiscourseService {
             window.localStorage.setItem('discourseAuthToken', '');
             this.authToken = '';
 
-            this.signinChange.emit(null);
+            this.signinChange.next(null);
             this.currentUser = null;
 
             throw new Error('User was logged out.');
@@ -88,6 +153,35 @@ export class DiscourseService {
         }
 
         throw new Error('Failed to fetch API, status code: ' + res.status);
+    }
+
+    public async externalCall(url: string, method?: string, data?: any) {
+        const clientId = await this.getClientId();
+
+        const finalMethod = method || 'GET';
+
+        const headers = {
+            'User-Agent': 'CitizenFX/Five',
+            'Content-Type': 'application/json',
+            'User-Api-Client-Id': clientId,
+            'User-Api-Key': this.authToken,
+            'Cfx-Entitlement-Ticket': this.ownershipTicket,
+        };
+
+        const finalData = (data) ? JSON.stringify(data) : undefined;
+
+        const req = new Request(url, {
+            headers,
+            method: finalMethod,
+            body: finalData
+        })
+
+        const res = await window.fetch(req);
+
+        return {
+            status: res.status,
+            data: await res.json()
+        };
     }
 
     public async getCurrentUser() {
@@ -106,7 +200,7 @@ export class DiscourseService {
         };
     }
 
-    public async handleAuthPayload(queryString: string) {
+    private async handleAuthPayload(queryString: string) {
         const parts = query.parse(queryString);
         const payload = parts['payload'] as string;
 
@@ -129,7 +223,7 @@ export class DiscourseService {
             const userInfo = await this.getCurrentUser();
 
             this.messageEvent.emit(`Thanks for linking your FiveM user account, ${userInfo.username}.`);
-            this.signinChange.emit(userInfo);
+            this.signinChange.next(userInfo);
 
             this.currentUser = userInfo;
         } catch (e) {
@@ -156,6 +250,14 @@ export class DiscourseService {
         };
 
         return `${DiscourseService.BASE_URL}/user-api-key/new?${this.serializeParams(params)}`;
+    }
+
+    public getToken() {
+        return this.authToken;
+    }
+
+    public getExtClientId() {
+        return this.clientId;
     }
 
     private async generateNonce() {

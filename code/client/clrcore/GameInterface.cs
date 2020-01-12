@@ -13,11 +13,19 @@ namespace CitizenFX.Core
 
         [SecurityCritical]
         [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern void PrintLog(string text);
+        public static extern void PrintLog(string channel, string text);
 
 		[SecurityCritical]
 		[MethodImpl(MethodImplOptions.InternalCall)]
 		public static extern ulong GetMemoryUsage();
+
+		[SecurityCritical]
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		public static extern bool SnapshotStackBoundary(out byte[] data);
+
+		[SecurityCritical]
+		[MethodImpl(MethodImplOptions.InternalCall)]
+		public static extern bool WalkStackBoundary(string resourceName, byte[] start, byte[] end, out byte[] blob);
 
 		[SecurityCritical]
 		[DllImport("CoreRT", EntryPoint = "CoreFxCreateObjectInstance")]

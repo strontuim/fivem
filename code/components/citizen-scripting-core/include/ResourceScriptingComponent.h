@@ -10,6 +10,7 @@
 #include <fxScripting.h>
 
 #include <tbb/concurrent_unordered_map.h>
+#include <tbb/concurrent_unordered_set.h>
 
 namespace fx
 {
@@ -24,11 +25,19 @@ private:
 
 	tbb::concurrent_unordered_map<int32_t, fx::OMPtr<IScriptRuntime>> m_scriptRuntimes;
 
+	tbb::concurrent_unordered_map<int32_t, fx::OMPtr<IScriptTickRuntime>> m_tickRuntimes;
+
+	tbb::concurrent_unordered_set<std::string> m_eventsHandled;
+
 private:
 	void CreateEnvironments();
 
 public:
 	ResourceScriptingComponent(Resource* resource);
+
+	fwEvent<> OnCreatedRuntimes;
+
+	fwEvent<const std::string&, const std::string&> OnOpenScript;
 
 	inline fx::OMPtr<IScriptHost> GetScriptHost()
 	{
@@ -64,6 +73,11 @@ public:
 	inline Resource* GetResource()
 	{
 		return m_resource;
+	}
+
+	inline void AddHandledEvent(const std::string& eventName)
+	{
+		m_eventsHandled.insert(eventName);
 	}
 };
 }

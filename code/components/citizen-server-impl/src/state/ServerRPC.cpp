@@ -15,6 +15,20 @@
 
 #include <RpcConfiguration.h>
 
+#include <CoreConsole.h>
+
+#define GLM_ENABLE_EXPERIMENTAL
+
+// TODO: clang style defines/checking
+#if defined(_M_IX86) || defined(_M_AMD64)
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+#define GLM_FORCE_SSE2
+#define GLM_FORCE_SSE3
+#endif
+
+#include <glm/vec3.hpp>
+#include <glm/gtx/norm.hpp>
+
 struct EntityCreationState
 {
 	// TODO: allow resending in case the target client disappears
@@ -31,11 +45,22 @@ inline uint32_t MakeEntityHandle(uint8_t playerId, uint16_t objectId)
 	return ((playerId + 1) << 16) | objectId;
 }
 
+namespace fx
+{
+	glm::vec3 GetPlayerFocusPos(const std::shared_ptr<sync::SyncEntityState>& entity);
+}
+
 static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* ref)
 	{
 		auto rpcConfiguration = RpcConfiguration::Load("citizen:/scripting/rpc_natives.json");
+
+		if (!rpcConfiguration)
+		{
+			console::PrintWarning("server", "Could not load rpc_natives.json. Is the server running from the correct directory, and is citizen_dir set?\n");
+			return;
+		}
 
 		auto clientRegistry = ref->GetComponent<fx::ClientRegistry>();
 		auto gameState = ref->GetComponent<fx::ServerGameState>();
@@ -51,21 +76,26 @@ static InitFunction initFunction([]()
 			if (it != g_entityCreationList.end())
 			{
 				auto guid = it->second.scriptGuid;
-				guid->type = fx::ScriptGuid::Type::Entity;
-				guid->entity.handle = MakeEntityHandle(0, objectId);
 
-				// broadcast entity creation
-				net::Buffer outBuffer;
-				outBuffer.Write<uint32_t>(HashRageString("msgRpcEntityCreation"));
-				outBuffer.Write<uint16_t>(creationToken);
-				outBuffer.Write<uint16_t>(objectId);
-
-				clientRegistry->ForAllClients([&](const std::shared_ptr<fx::Client>& cl)
+				if (guid->type == fx::ScriptGuid::Type::TempEntity)
 				{
-					cl->SendPacket(0, outBuffer, NetPacketType_Reliable);
-				});
+					guid->type = fx::ScriptGuid::Type::Entity;
+					guid->entity.handle = MakeEntityHandle(0, objectId);
+
+					// broadcast entity creation
+					net::Buffer outBuffer;
+					outBuffer.Write<uint32_t>(HashRageString("msgRpcEntityCreation"));
+					outBuffer.Write<uint16_t>(creationToken);
+					outBuffer.Write<uint16_t>(objectId);
+
+					clientRegistry->ForAllClients([&](const std::shared_ptr<fx::Client>& cl)
+					{
+						cl->SendPacket(0, outBuffer, NetPacketType_ReliableReplayed);
+					});
+				}
 
 				g_entityCreationList[creationToken] = {};
+
 			}
 		});
 
@@ -132,19 +162,103 @@ static InitFunction initFunction([]()
 				}
 				else if (native->GetRpcType() == RpcConfiguration::RpcType::EntityCreate)
 				{
-					// #TODO1S: intercept native coordinates and get a client near there
-					clientRegistry->ForAllClients([&](const std::shared_ptr<fx::Client>& client)
+					// 3 floats next to one another = pos
+					int flts = 0;
+					int startIdx = 0;
+					int idx = 0;
+					bool found = false;
+
+					for (auto& argument : native->GetArguments())
 					{
-						if (clientIdx != -1)
+						if (argument.GetType() == RpcConfiguration::ArgumentType::Float)
+						{
+							flts++;
+
+							if (flts == 1)
+							{
+								startIdx = idx;
+							}
+							else if (flts == 3)
+							{
+								found = true;
+								break;
+							}
+						}
+						else
+						{
+							flts = 0;
+						}
+
+						idx++;
+					}
+
+					// if no pos-style argument, route to first client we find
+					if (!found)
+					{
+						clientRegistry->ForAllClients([&](const std::shared_ptr<fx::Client>& client)
+						{
+							if (clientIdx != -1)
+							{
+								return;
+							}
+
+							if (client->GetData("playerEntity").has_value())
+							{
+								clientIdx = client->GetNetId();
+							}
+						});
+					}
+					else
+					{
+						// route to a nearby candidate
+						std::vector<std::tuple<float, std::shared_ptr<fx::Client>>> candidates;
+
+						glm::vec3 pos{ ctx.GetArgument<float>(startIdx), ctx.GetArgument<float>(startIdx + 1), ctx.GetArgument<float>(startIdx + 2) };
+
+						clientRegistry->ForAllClients([&candidates, gameState, pos](const std::shared_ptr<fx::Client>& tgtClient)
+						{
+							if (tgtClient->GetSlotId() == 0xFFFFFFFF)
+							{
+								return;
+							}
+
+							float distance = std::numeric_limits<float>::max();
+
+							try
+							{
+								std::weak_ptr<fx::sync::SyncEntityState> entityRef;
+
+								{
+									auto [data, lock] = gameState->ExternalGetClientData(tgtClient);
+									entityRef = data->playerEntity;
+								}
+
+								auto playerEntity = entityRef.lock();
+
+								if (playerEntity)
+								{
+									auto tgt = fx::GetPlayerFocusPos(playerEntity);
+
+									distance = glm::distance2(tgt, pos);
+								}
+							}
+							catch (std::bad_any_cast&)
+							{
+
+							}
+
+							candidates.emplace_back(distance, tgtClient);
+						});
+
+						std::sort(candidates.begin(), candidates.end());
+
+						if (candidates.size() == 0)
 						{
 							return;
 						}
 
-						if (client->GetData("playerEntity").has_value())
-						{
-							clientIdx = client->GetNetId();
-						}
-					});
+						clientIdx = std::get<1>(candidates[0])->GetNetId();
+					}
 				}
 
 				uint32_t resourceHash = -1;
@@ -167,7 +281,7 @@ static InitFunction initFunction([]()
 				buffer.Write<uint64_t>(native->GetGameHash());
 				buffer.Write<uint32_t>(resourceHash);
 
-				uint16_t creationToken;
+				uint16_t creationToken = 0;
 
 				if (native->GetRpcType() == RpcConfiguration::RpcType::EntityCreate)
 				{
@@ -276,7 +390,7 @@ static InitFunction initFunction([]()
 
 				auto sendToClient = [&](const std::shared_ptr<fx::Client>& cl)
 				{
-					cl->SendPacket(0, buffer, NetPacketType_Reliable);
+					cl->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
 				};
 
 				if (clientIdx == -1)
@@ -293,9 +407,10 @@ static InitFunction initFunction([]()
 					EntityCreationState state;
 					state.creationToken = creationToken;
 
-					auto guid = g_scriptHandlePool->New();
+					auto guid = new fx::ScriptGuid;
 					guid->type = fx::ScriptGuid::Type::TempEntity;
 					guid->tempEntity.creationToken = creationToken;
+					guid->reference = nullptr;
 
 					state.clientIdx = clientIdx;
 					state.scriptGuid = guid;

@@ -12,17 +12,17 @@
 #define RAGE_FORMATS_IN_GAME
 #include <gtaDrawable.h>
 
-static rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
+rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 {
 	streaming::Manager* streaming = streaming::Manager::GetInstance();
 	auto txdStore = streaming->moduleMgr.GetStreamingModule("ytd");
 
 	uint32_t id = -1;
-	txdStore->GetIndexByName(&id, txd.c_str());
+	txdStore->FindSlotFromHashKey(&id, txd.c_str());
 
 	if (id != 0xFFFFFFFF)
 	{
-		auto txdRef = (rage::five::pgDictionary<rage::grcTexture>*)txdStore->GetAssetPointer(id);
+		auto txdRef = (rage::five::pgDictionary<rage::grcTexture>*)txdStore->GetPtr(id);
 
 		if (txdRef)
 		{

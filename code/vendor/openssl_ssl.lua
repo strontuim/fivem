@@ -1,10 +1,13 @@
+local a = ...
+
 local openssl = require('./vendor/openssl_ext')
 local openssl_cfg = require('./vendor/openssl_cfg')
 
 return {
 	include = function()
 		if os.istarget('windows') then
-			includedirs { "vendor/openssl/include/" }
+			includedirs { "../vendor/openssl/include/" }
+			includedirs { "vendor/openssl/" }
 		else
 			links { 'ssl' }
 		end
@@ -23,11 +26,12 @@ return {
 		
 		buildoptions { '/MP' }
 		
-		add_dependencies 'vendor:openssl_crypto'
+		if not a then
+			add_dependencies 'vendor:openssl_crypto'
+		else
+			staticruntime 'On'
 		
-		if not os.isdir('vendor/openssl/') then
-			openssl.copy_public_headers(openssl_cfg)
-			os.copyfile('vendor/opensslconf.h', 'vendor/openssl/include/openssl/opensslconf.h')
+			add_dependencies 'vendor:openssl_crypto_crt'
 		end
 		
 		openssl.ssl_project(openssl_cfg)

@@ -7,13 +7,16 @@
 
 #include <ComponentHolder.h>
 
+#include <EASTL/fixed_list.h>
+
 #include <tbb/concurrent_unordered_map.h>
+#include <tbb/concurrent_queue.h>
 
 #include <any>
 
 #include <se/Security.h>
 
-#define MAX_CLIENTS 64 // don't change this past 256 ever, also needs to be synced with client code
+#define MAX_CLIENTS (1024 + 1) // don't change this past 256 ever, also needs to be synced with client code
 
 namespace {
 	using namespace std::literals::chrono_literals;
@@ -22,7 +25,7 @@ namespace {
 	constexpr const auto CLIENT_DEAD_TIMEOUT = 86400s;
 	constexpr const auto CLIENT_VERY_DEAD_TIMEOUT = 86400s;
 #else
-	constexpr const auto CLIENT_DEAD_TIMEOUT = 10s;
+	constexpr const auto CLIENT_DEAD_TIMEOUT = 60s;
 	constexpr const auto CLIENT_VERY_DEAD_TIMEOUT = 120s;
 #endif
 }
@@ -56,7 +59,7 @@ namespace fx
 		}
 	};
 
-	class SERVER_IMPL_EXPORT Client : public ComponentHolderImpl<Client>
+	class SERVER_IMPL_EXPORT Client : public ComponentHolderImpl<Client>, public std::enable_shared_from_this<Client>
 	{
 	public:
 		Client(const std::string& guid);
@@ -159,15 +162,19 @@ namespace fx
 		inline void AddIdentifier(const std::string& identifier)
 		{
 			m_identifiers.emplace_back(identifier);
+
+			UpdateCachedPrincipalValues();
 		}
 
 		inline auto EnterPrincipalScope()
 		{
-			std::vector<std::unique_ptr<se::ScopedPrincipal>> principals;
+			// since fixed_list contains the buffer inside of itself, and we have to move something unmoveable (since reference_wrapper-holding
+			// Principal instances would be allocated on the stack), we'll take *one* allocation on the heap.
+			auto principals = std::make_unique<eastl::fixed_list<se::ScopedPrincipal, 10, false>>();
 
-			for (auto& identifier : this->GetIdentifiers())
+			for (auto& principal : m_principals)
 			{
-				principals.emplace_back(std::make_unique<se::ScopedPrincipal>(se::Principal{ fmt::sprintf("identifier.%s", identifier) }));
+				principals->emplace_back(principal);
 			}
 
 			return std::move(principals);
@@ -183,6 +190,23 @@ namespace fx
 			m_syncData = ptr;
 		}
 
+		inline void PushReplayPacket(int channel, const net::Buffer& buffer)
+		{
+			m_replayQueue.push({ buffer, channel });
+		}
+
+		inline void ReplayPackets()
+		{
+			std::tuple<net::Buffer, int> value;
+
+			while (m_replayQueue.try_pop(value))
+			{
+				const auto&[buffer, channel] = value;
+
+				SendPacket(channel, buffer, NetPacketType_Reliable);
+			}
+		}
+
 		const std::any& GetData(const std::string& key);
 
 		void SetData(const std::string& key, const std::any& data);
@@ -195,6 +219,17 @@ namespace fx
 		fwEvent<> OnAssignConnectionToken;
 
 		fwEvent<> OnDrop;
+
+	private:
+		inline void UpdateCachedPrincipalValues()
+		{
+			m_principals = {};
+
+			for (auto& identifier : this->GetIdentifiers())
+			{
+				m_principals.emplace_back(se::Principal{ fmt::sprintf("identifier.%s", identifier) });
+			}
+		}
 
 	private:
 		// a temporary token for tying HTTP connections to UDP connections
@@ -236,7 +271,13 @@ namespace fx
 		// whether the client has sent a routing msg once
 		bool m_hasRouted;
 
+		// packets to resend when a new peer connects using this client
+		tbb::concurrent_queue<std::tuple<net::Buffer, int>> m_replayQueue;
+
 		// an arbitrary set of data
 		tbb::concurrent_unordered_map<std::string, std::any> m_userData;
+
+		// principal values
+		std::list<se::Principal> m_principals;
 	};
 }

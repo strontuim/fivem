@@ -293,6 +293,8 @@ int Client_send_udp(client_t *client, uint8_t *data, int len);
 static std::mutex mumblePairsMutex;
 static std::map<net::PeerAddress, bool> mumblePairs;
 
+extern std::recursive_mutex g_mumbleClientMutex;
+
 static InitFunction initFunction([]()
 {
 	Chan_init();
@@ -328,10 +330,17 @@ static InitFunction initFunction([]()
 		server->SetConnectionCallback([=](fwRefContainer<net::TcpServerStream> stream)
 		{
 			client_t* client;
-			Client_add(stream, &client);
+
+			{
+				std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+
+				Client_add(stream, &client);
+			}
 
 			stream->SetReadCallback([=](const std::vector<uint8_t>& data)
 			{
+				std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+
 				Timer_restart(&client->lastActivity);
 
 #if 0
@@ -410,11 +419,22 @@ static InitFunction initFunction([]()
 							Mh_handle_message(client, msg);
 						client->rxcount = client->msgsize = 0;
 					}
+					else
+					{
+						break;
+					}
+				}
+
+				// close stream if shutting down
+				if (client->shutdown_wait)
+				{
+					client->stream->Close();
 				}
 			});
 
 			stream->SetCloseCallback([=]()
 			{
+				std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
 				Client_free(client);
 			});
 		});
@@ -566,6 +586,8 @@ static InitFunction initFunction([]()
 				return;
 			}
 
+			std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+
 			client->interceptor = interceptor.GetRef();
 
 			*intercepted = true;
@@ -587,10 +609,12 @@ static InitFunction initFunction([]()
 				Client_send_udp(client, buffer, len);
 				break;
 			default:
+			{
 				auto clientAddressString = Util_clientAddressToString(client);
 				Log_debug("Unknown UDP message type from %s port %d", clientAddressString, address.GetPort());
 				free(clientAddressString);
 				break;
+			}
 			}
 		});
 	}, 999);

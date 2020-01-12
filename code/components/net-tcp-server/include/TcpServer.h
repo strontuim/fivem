@@ -24,6 +24,8 @@ public:
 
 	typedef std::function<void()> TCloseCallback;
 
+	typedef std::function<void()> TScheduledCallback;
+
 private:
 	TReadCallback m_readCallback;
 
@@ -47,13 +49,19 @@ public:
 
 	virtual void Write(const std::string& data);
 
+	virtual void Write(std::string&& data);
+
 	virtual void Write(const std::vector<uint8_t>& data) = 0;
+
+	virtual void Write(std::vector<uint8_t>&& data);
 
 	virtual void Close() = 0;
 
 	void SetReadCallback(const TReadCallback& callback);
 
 	void SetCloseCallback(const TCloseCallback& callback);
+
+	virtual void ScheduleCallback(const TScheduledCallback& callback);
 
 protected:
 	TcpServerStream() { }

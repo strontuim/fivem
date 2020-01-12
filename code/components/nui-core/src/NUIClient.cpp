@@ -12,11 +12,25 @@
 #include "memdbgon.h"
 #include "HttpClient.h"
 
+#include <IteratorView.h>
+
 #include <CoreConsole.h>
 
 #include <rapidjson/document.h>
 
 #include <sstream>
+
+static nui::IAudioSink* g_audioSink;
+
+namespace nui
+{
+	void SetAudioSink(IAudioSink* sinkRef)
+	{
+		g_audioSink = sinkRef;
+	}
+
+	void RecreateFrames();
+}
 
 NUIClient::NUIClient(NUIWindow* window)
 	: m_window(window)
@@ -25,8 +39,10 @@ NUIClient::NUIClient(NUIWindow* window)
 
 	m_renderHandler = new NUIRenderHandler(this);
 
+	CefRefPtr<NUIClient> thisRef(this);
+
 	auto httpClient = Instance<HttpClient>::Get();
-	httpClient->DoGetRequest("https://runtime.fivem.net/nui-blacklist.json", [=](bool success, const char* data, size_t length)
+	httpClient->DoGetRequest("https://runtime.fivem.net/nui-blacklist.json", [thisRef](bool success, const char* data, size_t length)
 	{
 		if (success)
 		{
@@ -41,7 +57,7 @@ NUIClient::NUIClient(NUIWindow* window)
 					{
 						if (it->IsString())
 						{
-							m_requestBlacklist.emplace_back(it->GetString(), std::regex_constants::ECMAScript | std::regex_constants::icase);
+							thisRef->m_requestBlacklist.emplace_back(it->GetString(), std::regex_constants::ECMAScript | std::regex_constants::icase);
 						}
 					}
 				}
@@ -52,6 +68,11 @@ NUIClient::NUIClient(NUIWindow* window)
 
 void NUIClient::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, TransitionType transitionType)
 {
+	if (g_audioSink)
+	{
+		browser->GetHost()->SetAudioMuted(true);
+	}
+
 	GetWindow()->OnClientContextCreated(browser, frame, nullptr);
 }
 
@@ -59,11 +80,16 @@ void NUIClient::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> fra
 {
 	auto url = frame->GetURL();
 
-	if (url == "nui://game/ui/root.html" && nui::HasMainUI())
+	if (url == "nui://game/ui/root.html")
 	{
 		static ConVar<std::string> uiUrlVar("ui_url", ConVar_None, "https://nui-game-internal/ui/app/index.html");
 
-		nui::CreateFrame("mpMenu", uiUrlVar.GetValue());
+		nui::RecreateFrames();
+
+		if (nui::HasMainUI())
+		{
+			nui::CreateFrame("mpMenu", uiUrlVar.GetValue());
+		}
 	}
 
 	// replace any segoe ui symbol font
@@ -104,11 +130,18 @@ bool NUIClient::OnConsoleMessage(CefRefPtr<CefBrowser> browser, cef_log_severity
 	std::wstring sourceStr = source.ToWString();
 	std::wstring messageStr = message.ToWString();
 
+	// skip websocket error messages
+	// these can't be blocked from script and users get very confused by them appearing in console
+	if (messageStr.find(L"WebSocket connection to") != std::string::npos)
+	{
+		return false;
+	}
+
 	std::wstringstream msg;
 	msg << sourceStr << ":" << line << ", " << messageStr << std::endl;
 
 	OutputDebugString(msg.str().c_str());
-	trace("%s\n", ToNarrow(msg.str()));
+	trace("%s", ToNarrow(msg.str()));
 
 	return false;
 }
@@ -134,6 +167,121 @@ void NUIClient::AddProcessMessageHandler(std::string key, TProcessMessageHandler
 	m_processMessageHandlers[key] = handler;
 }
 
+void NUIClient::OnAudioCategoryConfigure(const std::string& frame, const std::string& category)
+{
+	m_audioFrameCategories[frame] = category;
+
+	if (!g_audioSink)
+	{
+		return;
+	}
+
+	// recreate any streams
+	for (auto& streamEntry : fx::GetIteratorView(m_audioStreamsByFrame.equal_range(frame)))
+	{
+		auto streamIt = m_audioStreams.find(streamEntry.second);
+
+		if (streamIt != m_audioStreams.end())
+		{
+			auto params = std::get<1>(streamIt->second);
+			params.categoryName = category;
+
+			m_audioStreams.erase(streamIt);
+
+			auto stream = g_audioSink->CreateAudioStream(params);
+			m_audioStreams.insert({ streamEntry.second, { stream, params } });
+		}
+	}
+}
+
+void NUIClient::OnAudioStreamStarted(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int audio_stream_id, int channels, ChannelLayout channel_layout, int sample_rate, int frames_per_buffer)
+{
+	if (g_audioSink)
+	{
+		nui::AudioStreamParams params;
+		params.channelLayout = (nui::CefChannelLayout)channel_layout;
+		params.channels = channels;
+		params.sampleRate = sample_rate;
+		params.framesPerBuffer = frames_per_buffer;
+
+		// try finding the second-topmost frame
+		auto refFrame = frame;
+
+		for (auto f = refFrame; f->GetParent(); f = f->GetParent())
+		{
+			if (!f->GetParent()->GetParent())
+			{
+				refFrame = f;
+				break;
+			}
+		}
+
+		// get frame name
+		auto frameName = ToNarrow(refFrame->GetName().ToWString());
+		params.frameName = std::move(frameName);
+
+		auto categoryIt = m_audioFrameCategories.find(params.frameName);
+
+		if (categoryIt != m_audioFrameCategories.end())
+		{
+			params.categoryName = categoryIt->second;
+		}
+
+		// and create audio stream
+		auto stream = g_audioSink->CreateAudioStream(params);
+
+		m_audioStreams.insert({ { browser->GetIdentifier(), audio_stream_id }, { stream, params } });
+		m_audioStreamsByFrame.insert({ params.frameName, { browser->GetIdentifier(), audio_stream_id } });
+	}
+}
+
+void NUIClient::OnAudioStreamPacket(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int audio_stream_id, const float** data, int frames, int64 pts)
+{
+	auto it = m_audioStreams.find({ browser->GetIdentifier(), audio_stream_id });
+
+	if (it != m_audioStreams.end())
+	{
+		std::get<0>(it->second)->ProcessPacket(data, frames, pts);
+	}
+}
+
+void NUIClient::OnAudioStreamStopped(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int audio_stream_id)
+{
+	auto refFrame = frame;
+
+	for (auto f = refFrame; f->GetParent(); f = f->GetParent())
+	{
+		if (!f->GetParent()->GetParent())
+		{
+			refFrame = f;
+			break;
+		}
+	}
+
+	// get frame name
+	auto frameName = ToNarrow(refFrame->GetName().ToWString());
+	m_audioStreamsByFrame.erase(frameName);
+
+	m_audioStreams.erase({ browser->GetIdentifier(), audio_stream_id });
+}
+
+extern bool g_shouldCreateRootWindow;
+
+void NUIClient::OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser, TerminationStatus status)
+{
+	if (browser->GetMainFrame()->GetURL() == "nui://game/ui/root.html")
+	{
+		browser->GetHost()->CloseBrowser(true);
+
+		g_shouldCreateRootWindow = true;
+	}
+}
+
+void NUIClient::OnBeforeClose(CefRefPtr<CefBrowser> browser)
+{
+	m_browser = {};
+}
+
 CefRefPtr<CefLifeSpanHandler> NUIClient::GetLifeSpanHandler()
 {
 	return this;
@@ -157,6 +305,14 @@ CefRefPtr<CefLoadHandler> NUIClient::GetLoadHandler()
 CefRefPtr<CefRequestHandler> NUIClient::GetRequestHandler()
 {
 	return this;
+}
+
+CefRefPtr<CefAudioHandler> NUIClient::GetAudioHandler()
+{
+	// #TODONUI: render process termination does not work this way, needs an owning reference to the browser
+	// or otherwise tracking why the browser doesn't become null when playing audio and killing the render process
+	return nullptr;
+	//return this;
 }
 
 CefRefPtr<CefRenderHandler> NUIClient::GetRenderHandler()

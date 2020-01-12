@@ -13,6 +13,8 @@
 
 #include <msgpack.hpp>
 
+#include <DebugAlias.h>
+
 static inline bool IsServer()
 {
 #ifdef IS_FXSERVER
@@ -38,8 +40,6 @@ void ResourceEventComponent::AttachToObject(Resource* object)
 	// start/stop handling events
 	object->OnBeforeStart.Connect([=] ()
 	{
-		OnTriggerEvent.Reset();
-
 		// pack the resource name
 		msgpack::sbuffer buf;
 		msgpack::packer<msgpack::sbuffer> packer(buf);
@@ -70,6 +70,11 @@ void ResourceEventComponent::AttachToObject(Resource* object)
 		m_managerComponent->QueueEvent2(fmt::sprintf("on%sResourceStop", IsServer() ? "Server" : "Client"), {}, m_resource->GetName());
 	});
 
+	object->OnStop.Connect([=] ()
+	{
+		OnTriggerEvent.Reset();
+	}, INT32_MAX);
+
 	object->OnStop.Connect([=]()
 	{
 		m_managerComponent->TriggerEvent2("onResourceStop", {}, m_resource->GetName());
@@ -96,6 +101,17 @@ void ResourceEventComponent::AttachToObject(Resource* object)
 
 void ResourceEventComponent::HandleTriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
 {
+	// save data in case we need to trace this back from dumps
+	char resourceNameBit[128];
+	char eventNameBit[128];
+
+	strncpy(resourceNameBit, m_resource->GetName().c_str(), std::size(resourceNameBit));
+	strncpy(eventNameBit, eventName.c_str(), std::size(eventNameBit));
+	
+	debug::Alias(resourceNameBit);
+	debug::Alias(eventNameBit);
+
+	// trigger event
 	OnTriggerEvent(eventName, eventPayload, eventSource, eventCanceled);
 }
 

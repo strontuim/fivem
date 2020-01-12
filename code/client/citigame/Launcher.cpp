@@ -69,7 +69,7 @@ bool LauncherInterface::PostLoadGame(HMODULE hModule, void(**entryPoint)())
 #elif defined(PAYNE)
 	// don't modify the entry point
 	//*entryPoint = (void(*)())0;
-#elif defined(GTA_FIVE)
+#elif defined(_M_AMD64)
 #else
 #error TODO: define entry point for this title
 #endif
@@ -116,6 +116,8 @@ bool LauncherInterface::PreInitializeGame()
 	// run callbacks on the component loader
     if (!getenv("CitizenFX_ToolMode"))
     {
+		DisableToolHelpScope thScope;
+
         RunLifeCycleCallback([] (LifeCycleComponent* component)
         {
             component->PreInitGame();

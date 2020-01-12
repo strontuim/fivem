@@ -1,10 +1,11 @@
+using CitizenFX.Core.Native;
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 
-using static CitizenFX.Core.Native.Function;
-using static CitizenFX.Core.Native.Hash;
+using static CitizenFX.Core.Native.API;
 
 namespace CitizenFX.Core
 {
@@ -24,17 +25,19 @@ namespace CitizenFX.Core
 			m_handle = sourceString;
 		}
 
-		public string Name => Call<string>(GET_PLAYER_NAME, m_handle);
+		public string Name => GetPlayerName(m_handle);
 
-		public int Ping => Call<int>(GET_PLAYER_PING, m_handle);
+		public int Ping => GetPlayerPing(m_handle);
 
-		public int LastMsg => Call<int>(GET_PLAYER_LAST_MSG, m_handle);
+		public int LastMsg => GetPlayerLastMsg(m_handle);
 
 		public IdentifierCollection Identifiers => new IdentifierCollection(this);
 
-		public string EndPoint => Call<string>(GET_PLAYER_ENDPOINT, m_handle);
+		public string EndPoint => GetPlayerEndpoint(m_handle);
 
-		public void Drop(string reason) => Call(DROP_PLAYER, m_handle, reason);
+		public Ped Character => Ped.FromPlayerHandle(m_handle);
+
+		public void Drop(string reason) => DropPlayer(m_handle, reason);
 
 		public void TriggerEvent(string eventName, params object[] args)
 		{
@@ -44,7 +47,20 @@ namespace CitizenFX.Core
 			{
 				fixed (byte* serialized = &argsSerialized[0])
 				{
-					Call(TRIGGER_CLIENT_EVENT_INTERNAL, eventName, m_handle, serialized, argsSerialized.Length);
+					Function.Call(Hash.TRIGGER_CLIENT_EVENT_INTERNAL, eventName, m_handle, serialized, argsSerialized.Length);
+				}
+			}
+		}
+
+		public void TriggerLatentEvent(string eventName, int bytesPerSecond, params object[] args)
+		{
+			var argsSerialized = MsgPackSerializer.Serialize(args);
+
+			unsafe
+			{
+				fixed (byte* serialized = &argsSerialized[0])
+				{
+					Function.Call(Hash.TRIGGER_LATENT_CLIENT_EVENT_INTERNAL, eventName, m_handle, serialized, argsSerialized.Length, bytesPerSecond);
 				}
 			}
 		}
@@ -91,11 +107,11 @@ namespace CitizenFX.Core
 
 		public IEnumerator<string> GetEnumerator()
 		{
-			int numIndices = Call<int>(GET_NUM_PLAYER_IDENTIFIERS, m_player.Handle);
+			int numIndices = GetNumPlayerIdentifiers(m_player.Handle);
 
 			for (var i = 0; i < numIndices; i++)
 			{
-				yield return Call<string>(GET_PLAYER_IDENTIFIER, m_player.Handle, i);
+				yield return GetPlayerIdentifier(m_player.Handle, i);
 			}
 		}
 
@@ -119,11 +135,11 @@ namespace CitizenFX.Core
 	{
 		public IEnumerator<Player> GetEnumerator()
 		{
-			int numIndices = Call<int>(GET_NUM_PLAYER_INDICES);
+			int numIndices = GetNumPlayerIndices();
 
 			for (var i = 0; i < numIndices; i++)
 			{
-				yield return new Player(Call<string>(GET_PLAYER_FROM_INDEX, i));
+				yield return new Player(GetPlayerFromIndex(i));
 			}
 		}
 

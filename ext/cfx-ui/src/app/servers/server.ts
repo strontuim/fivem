@@ -12,8 +12,10 @@ export class Server {
     readonly strippedname: string;
     readonly maxPlayers: number;
     readonly data: any;
+    readonly connectEndPoints: string[];
     readonly int: master.IServerData;
 
+    bitmap: ImageBitmap;
     onChanged = new EventEmitter<void>();
 
     realIconUri: string;
@@ -24,33 +26,18 @@ export class Server {
 
     set iconUri(value: string) {
         this.realIconUri = value;
-        this.sanitizedUri = this.sanitizer.bypassSecurityTrustUrl(value);
-        this.sanitizedStyleUri = this.sanitizer.bypassSecurityTrustStyle('url(' + value + ')');
+
+        if (this.sanitizer) {
+            this.sanitizedUri = this.sanitizer.bypassSecurityTrustUrl(value);
+            this.sanitizedStyleUri = this.sanitizer.bypassSecurityTrustStyle('url(' + value + ')');
+        }
     }
 
     sanitizedUri: any;
     sanitizedStyleUri: any;
     currentPlayers: number;
     ping = 9999;
-
-    public updatePing(newValue: number): void {
-        this.ping = newValue;
-
-        this.onChanged.emit();
-    }
-
-    public getSortable(name: string): any {
-        switch (name) {
-            case 'name':
-                return this.sortname;
-            case 'ping':
-                return this.ping;
-            case 'players':
-                return this.currentPlayers;
-            default:
-                throw new Error('Unknown sortable');
-        }
-    }
+    upvotePower = 0;
 
     public static fromObject(sanitizer: DomSanitizer, address: string, object: master.IServerData): Server {
         return new Server(sanitizer, address, object);
@@ -75,6 +62,27 @@ export class Server {
         return server;
     }
 
+    public updatePing(newValue: number): void {
+        this.ping = newValue;
+
+        this.onChanged.emit();
+    }
+
+    public getSortable(name: string): any {
+        switch (name) {
+            case 'name':
+                return this.sortname;
+            case 'ping':
+                return this.ping;
+            case 'players':
+                return this.currentPlayers;
+            case 'upvotePower':
+                return this.upvotePower;
+            default:
+                throw new Error('Unknown sortable');
+        }
+    }
+
     private constructor(private sanitizer: DomSanitizer, address: string, object: master.IServerData) {
         // temp compat behavior
         this.address = address;
@@ -83,22 +91,29 @@ export class Server {
         this.maxPlayers = object.svMaxclients | 0;
 
         this.strippedname = (this.hostname || '').replace(/\^[0-9]/g, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        this.sortname = this.strippedname.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+        this.sortname = this.strippedname.replace(/[^a-zA-Z0-9]/g, '').replace(/^[0-9]+/g, '').toLowerCase();
+
+        // only weird characters? sort on the bottom
+        if (this.sortname.length === 0) {
+            this.sortname = 'z';
+        }
 
         if (object.vars && object.vars.ping) {
             this.ping = parseInt(object.vars.ping, 10);
             delete object.vars['ping'];
         }
 
+        this.upvotePower = object.upvotePower || 0;
         this.data = object;
         this.int = object;
+        this.connectEndPoints = object.connectEndPoints;
 
-        if (!object.iconVersion) {
+        if (!object.iconVersion && sanitizer) {
             const svg = Avatar.getFor(this.address);
 
             this.iconUri = `data:image/svg+xml,${encodeURIComponent(svg)}`;
         } else {
-            this.iconUri = `https://runtime.fivem.net/servers/icon/${address}/${object.iconVersion}.png`;
+            this.iconUri = `https://servers-live.fivem.net/servers/icon/${address}/${object.iconVersion}.png`;
         }
     }
 }
@@ -113,10 +128,4 @@ export class ServerIcon {
         this.icon = icon;
         this.iconVersion = iconVersion;
     }
-}
-
-export class PinConfig {
-    pinIfEmpty = false;
-
-    pinnedServers: string[] = [];
 }

@@ -328,6 +328,8 @@ $root.master = (function() {
          * @property {number} [iconVersion] ServerData iconVersion
          * @property {Object.<string,string>} [vars] ServerData vars
          * @property {boolean} [enhancedHostSupport] ServerData enhancedHostSupport
+         * @property {number} [upvotePower] ServerData upvotePower
+         * @property {Array.<string>} [connectEndPoints] ServerData connectEndPoints
          */
 
         /**
@@ -341,6 +343,7 @@ $root.master = (function() {
             this.resources = [];
             this.players = [];
             this.vars = {};
+            this.connectEndPoints = [];
             if (properties)
                 for (var keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                     if (properties[keys[i]] != null)
@@ -444,6 +447,22 @@ $root.master = (function() {
         ServerData.prototype.enhancedHostSupport = false;
 
         /**
+         * ServerData upvotePower.
+         * @member {number}upvotePower
+         * @memberof master.ServerData
+         * @instance
+         */
+        ServerData.prototype.upvotePower = 0;
+
+        /**
+         * ServerData connectEndPoints.
+         * @member {Array.<string>}connectEndPoints
+         * @memberof master.ServerData
+         * @instance
+         */
+        ServerData.prototype.connectEndPoints = $util.emptyArray;
+
+        /**
          * Creates a new ServerData instance using the specified properties.
          * @function create
          * @memberof master.ServerData
@@ -494,6 +513,11 @@ $root.master = (function() {
                     writer.uint32(/* id 12, wireType 2 =*/98).fork().uint32(/* id 1, wireType 2 =*/10).string(keys[i]).uint32(/* id 2, wireType 2 =*/18).string(message.vars[keys[i]]).ldelim();
             if (message.enhancedHostSupport != null && message.hasOwnProperty("enhancedHostSupport"))
                 writer.uint32(/* id 16, wireType 0 =*/128).bool(message.enhancedHostSupport);
+            if (message.upvotePower != null && message.hasOwnProperty("upvotePower"))
+                writer.uint32(/* id 17, wireType 0 =*/136).int32(message.upvotePower);
+            if (message.connectEndPoints != null && message.connectEndPoints.length)
+                for (var i = 0; i < message.connectEndPoints.length; ++i)
+                    writer.uint32(/* id 18, wireType 2 =*/146).string(message.connectEndPoints[i]);
             return writer;
         };
 
@@ -572,6 +596,14 @@ $root.master = (function() {
                     break;
                 case 16:
                     message.enhancedHostSupport = reader.bool();
+                    break;
+                case 17:
+                    message.upvotePower = reader.int32();
+                    break;
+                case 18:
+                    if (!(message.connectEndPoints && message.connectEndPoints.length))
+                        message.connectEndPoints = [];
+                    message.connectEndPoints.push(reader.string());
                     break;
                 default:
                     reader.skipType(tag & 7);
@@ -659,6 +691,16 @@ $root.master = (function() {
             if (message.enhancedHostSupport != null && message.hasOwnProperty("enhancedHostSupport"))
                 if (typeof message.enhancedHostSupport !== "boolean")
                     return "enhancedHostSupport: boolean expected";
+            if (message.upvotePower != null && message.hasOwnProperty("upvotePower"))
+                if (!$util.isInteger(message.upvotePower))
+                    return "upvotePower: integer expected";
+            if (message.connectEndPoints != null && message.hasOwnProperty("connectEndPoints")) {
+                if (!Array.isArray(message.connectEndPoints))
+                    return "connectEndPoints: array expected";
+                for (var i = 0; i < message.connectEndPoints.length; ++i)
+                    if (!$util.isString(message.connectEndPoints[i]))
+                        return "connectEndPoints: string[] expected";
+            }
             return null;
         };
 
@@ -716,6 +758,15 @@ $root.master = (function() {
             }
             if (object.enhancedHostSupport != null)
                 message.enhancedHostSupport = Boolean(object.enhancedHostSupport);
+            if (object.upvotePower != null)
+                message.upvotePower = object.upvotePower | 0;
+            if (object.connectEndPoints) {
+                if (!Array.isArray(object.connectEndPoints))
+                    throw TypeError(".master.ServerData.connectEndPoints: array expected");
+                message.connectEndPoints = [];
+                for (var i = 0; i < object.connectEndPoints.length; ++i)
+                    message.connectEndPoints[i] = String(object.connectEndPoints[i]);
+            }
             return message;
         };
 
@@ -735,6 +786,7 @@ $root.master = (function() {
             if (options.arrays || options.defaults) {
                 object.resources = [];
                 object.players = [];
+                object.connectEndPoints = [];
             }
             if (options.objects || options.defaults)
                 object.vars = {};
@@ -748,6 +800,7 @@ $root.master = (function() {
                 object.server = "";
                 object.iconVersion = 0;
                 object.enhancedHostSupport = false;
+                object.upvotePower = 0;
             }
             if (message.svMaxclients != null && message.hasOwnProperty("svMaxclients"))
                 object.svMaxclients = message.svMaxclients;
@@ -783,6 +836,13 @@ $root.master = (function() {
             }
             if (message.enhancedHostSupport != null && message.hasOwnProperty("enhancedHostSupport"))
                 object.enhancedHostSupport = message.enhancedHostSupport;
+            if (message.upvotePower != null && message.hasOwnProperty("upvotePower"))
+                object.upvotePower = message.upvotePower;
+            if (message.connectEndPoints && message.connectEndPoints.length) {
+                object.connectEndPoints = [];
+                for (var j = 0; j < message.connectEndPoints.length; ++j)
+                    object.connectEndPoints[j] = message.connectEndPoints[j];
+            }
             return object;
         };
 

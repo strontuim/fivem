@@ -15,8 +15,11 @@ export class AppNavComponent extends Translation {
 	nickname = '';
 	devMode = false;
 	localhostPort = '';
+	language = '';
 	hasSubNav = false;
 	isInSteam = false;
+	brandingName = 'CitizenFX';
+	gameName = 'gta5';
 
 	constructor(
 		private gameService: GameService,
@@ -29,7 +32,10 @@ export class AppNavComponent extends Translation {
 		this.nickname = gameService.nickname;
 		this.devMode = gameService.devMode;
 		this.localhostPort = gameService.localhostPort;
-		
+		this.language = gameService.language;
+
+		this.brandingName = gameService.brandingName;
+		this.gameName = gameService.gameName;
 
 		router.events.subscribe(event => {
 			if ((<NavigationEnd>event).url) {
@@ -44,10 +50,11 @@ export class AppNavComponent extends Translation {
 		gameService.nicknameChange.subscribe(value => this.nickname = value);
 		gameService.devModeChange.subscribe(value => this.devMode = value);
 		gameService.localhostPortChange.subscribe(value => this.localhostPort = value);
+		gameService.languageChange.subscribe(value => this.language = value);
 	}
 
 	connectToLocal() {
-		(<any>window).invokeNative('connectTo', (typeof this.localhostPort === 'undefined') ? '127.0.0.1:30120' : '127.0.0.1:' + this.localhostPort );
+		(<any>window).invokeNative('connectTo', '127.0.0.1:' + (this.localhostPort || '30120') );
 	}
 
 	exitGame() {

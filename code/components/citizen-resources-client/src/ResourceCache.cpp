@@ -15,8 +15,8 @@
 
 #include <Error.h>
 
-ResourceCache::ResourceCache(const std::string& cachePath)
-	: m_cachePath(cachePath)
+ResourceCache::ResourceCache(const std::string& cachePath, const std::string& physCachePath)
+	: m_cachePath(cachePath), m_physCachePath(physCachePath)
 {
 	OpenDatabase();
 
@@ -35,9 +35,26 @@ void ResourceCache::OpenDatabase()
 
 	auto status = leveldb::DB::Open(options, m_cachePath + "/db/", &dbPointer);
 
-	if (status.IsCorruption())
+	if (status.IsCorruption() || status.IsIOError())
 	{
-		FatalError("Opening database (%s) failed with corruption state (%s) - please delete this folder.", m_cachePath + "/db/", status.ToString());
+		leveldb::Options repairOptions;
+		repairOptions.reuse_logs = false;
+		repairOptions.create_if_missing = true;
+		repairOptions.env = GetVFSEnvironment();
+
+		status = leveldb::RepairDB(m_cachePath + "/db/", repairOptions);
+
+		if (status.ok())
+		{
+			status = leveldb::DB::Open(options, m_cachePath + "/db/", &dbPointer);
+		}
+
+		if (!status.ok())
+		{
+			status = leveldb::DestroyDB(m_cachePath + "/db/", options);
+
+			status = leveldb::DB::Open(options, m_cachePath + "/db/", &dbPointer);
+		}
 	}
 
 	if (!status.ok())
@@ -175,6 +192,7 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 		std::string key = "cache:v1:" + std::string(reinterpret_cast<const char*>(hash.data()), 20);
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+		m_entryCache[key] = {};
 	}
 
 	{
@@ -184,22 +202,33 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 		std::string key = "cache:v1:url:" + fromIt->second;
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+		m_entryCache[key] = {};
 	}
 
 	trace("ResourceCache::AddEntry: Saved cache:v1:%s to the index cache.\n", hashString);
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::array<uint8_t, 20>& hash)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::array<uint8_t, 20>& hash)
 {
 	// attempt a database get
 	std::string key = "cache:v1:" + std::string(reinterpret_cast<const char*>(&hash[0]), hash.size());
 	std::string value;
 
+	auto fetchIt = m_entryCache.find(key);
+
+	if (fetchIt != m_entryCache.end() && fetchIt->second)
+	{
+		return *fetchIt->second;
+	}
+
 	leveldb::Status status = m_indexDatabase->Get(leveldb::ReadOptions{}, key, &value);
 
 	if (status.ok())
 	{
-		return boost::optional<Entry>(Entry(value));
+		Entry e{ value };
+		m_entryCache[key] = std::optional<Entry>(e);
+
+		return std::optional<Entry>(e);
 	}
 
 	if (!status.IsNotFound())
@@ -211,15 +240,16 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::arra
 #endif
 	}
 
-	return boost::optional<Entry>();
+	m_entryCache[key] = { std::optional<Entry>{} };
+	return std::optional<Entry>();
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::string& hashString)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::string& hashString)
 {
 	return GetEntryFor(ParseHexString<20>(hashString.c_str()));
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceCacheEntryList::Entry& entry)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceCacheEntryList::Entry& entry)
 {
 	if (entry.referenceHash.empty())
 	{
@@ -231,7 +261,7 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceC
 
 		if (status.ok())
 		{
-			return boost::optional<Entry>(Entry(value));
+			return std::optional<Entry>(Entry(value));
 		}
 
 		if (!status.IsNotFound())
@@ -243,7 +273,7 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceC
 #endif
 		}
 
-		return boost::optional<Entry>();
+		return std::optional<Entry>();
 	}
 
 	return GetEntryFor(entry.referenceHash);

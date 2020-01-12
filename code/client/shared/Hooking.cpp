@@ -31,7 +31,7 @@ namespace hook
 #else
 	void* AllocateFunctionStub(void* ptr, int type)
 	{
-#if defined(GTA_FIVE)
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 		typedef void*(*AllocateType)(void*, int);
 		static AllocateType func;
 
@@ -46,5 +46,31 @@ namespace hook
 		return ptr;
 #endif
 	}
+
+	void* AllocateStubMemory(size_t size)
+	{
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+		static decltype(&AllocateStubMemory) func;
+
+		if (func == nullptr)
+		{
+			HMODULE coreRuntime = GetModuleHandleW(L"CoreRT.dll");
+			func = (decltype(func))GetProcAddress(coreRuntime, "AllocateStubMemoryImpl");
+		}
+
+		return func(size);
+#else
+		return nullptr;
 #endif
+	}
+#endif
+
+	ptrdiff_t baseAddressDifference;
 }
+
+#ifndef IS_FXSERVER
+static InitFunction initHookingFunction([]()
+{
+	hook::set_base();
+}, INT32_MIN);
+#endif

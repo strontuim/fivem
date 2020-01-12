@@ -29,25 +29,43 @@ static const int g_colors[] = {
 	34  // dark blue
 };
 
+static void Print(const char* str)
+{
+	printf("%s", str);
+}
+
+static auto g_printf = &Print;
+
 static void CfxPrintf(const std::string& str)
 {
+	std::stringstream buf;
+
 	for (size_t i = 0; i < str.size(); i++)
 	{
 		if (str[i] == '^' && _isdigit(str[i + 1]))
 		{
 			if (g_allowVt)
 			{
-				printf("\x1B[%dm", g_colors[str[i + 1] - '0']);
+				buf << fmt::sprintf("\x1B[%dm", g_colors[str[i + 1] - '0']);
 			}
 
 			i += 1;
 		}
 		else
 		{
-			printf("%c", str[i]);
+			buf << fmt::sprintf("%c", str[i]);
 		}
 	}
+
+	g_printf(buf.str().c_str());
 }
+
+static std::once_flag g_initConsoleFlag;
+static std::condition_variable g_consoleCondVar;
+static std::mutex g_consoleMutex;
+
+static tbb::concurrent_queue<std::string> g_consolePrintQueue;
+static bool g_isPrinting;
 
 static void PrintfTraceListener(ConsoleChannel channel, const char* out)
 {
@@ -59,10 +77,22 @@ static void PrintfTraceListener(ConsoleChannel channel, const char* out)
 		HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
 
 		DWORD consoleMode;
-		GetConsoleMode(hConsole, &consoleMode);
-		consoleMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+		if (GetConsoleMode(hConsole, &consoleMode))
+		{
+			consoleMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 
-		if (SetConsoleMode(hConsole, consoleMode))
+			if (SetConsoleMode(hConsole, consoleMode))
+			{
+				g_allowVt = true;
+			}
+
+			if (IsWindows10OrGreater())
+			{
+				SetConsoleCP(65001);
+				SetConsoleOutputCP(65001);
+			}
+		}
+		else
 		{
 			g_allowVt = true;
 		}
@@ -70,12 +100,6 @@ static void PrintfTraceListener(ConsoleChannel channel, const char* out)
 #else
 	g_allowVt = true;
 #endif
-
-	static std::once_flag g_initConsoleFlag;
-	static std::condition_variable g_consoleCondVar;
-	static std::mutex g_consoleMutex;
-
-	static tbb::concurrent_queue<std::string> g_consolePrintQueue;
 
 	std::call_once(g_initConsoleFlag, []()
 	{
@@ -94,7 +118,9 @@ static void PrintfTraceListener(ConsoleChannel channel, const char* out)
 
 				while (g_consolePrintQueue.try_pop(str))
 				{
+					g_isPrinting = true;
 					CfxPrintf(str);
+					g_isPrinting = false;
 				}
 			}
 		}).detach();
@@ -103,13 +129,21 @@ static void PrintfTraceListener(ConsoleChannel channel, const char* out)
 	g_consolePrintQueue.push(std::string{ out });
 	g_consoleCondVar.notify_all();
 }
+}
 
+bool GIsPrinting()
+{
+	return !console::g_consolePrintQueue.empty() || console::g_isPrinting;
+}
+
+namespace console
+{
 static std::vector<void(*)(ConsoleChannel, const char*)> g_printListeners = { PrintfTraceListener };
 static int g_useDeveloper;
 
-void Printf(ConsoleChannel channel, const char* format, const fmt::ArgList& argList)
+void Printfv(ConsoleChannel channel, std::string_view format, fmt::printf_args argList)
 {
-	auto buffer = fmt::sprintf(format, argList);
+	auto buffer = fmt::vsprintf(format, argList);
 
 	// print to all interested listeners
 	for (auto& listener : g_printListeners)
@@ -118,24 +152,24 @@ void Printf(ConsoleChannel channel, const char* format, const fmt::ArgList& argL
 	}
 }
 
-void DPrintf(ConsoleChannel channel, const char* format, const fmt::ArgList& argList)
+void DPrintfv(ConsoleChannel channel, std::string_view format, fmt::printf_args argList)
 {
 	if (g_useDeveloper > 0)
 	{
-		Printf(channel, format, argList);
+		Printfv(channel, format, argList);
 	}
 }
 
-void PrintWarning(ConsoleChannel channel, const char* format, const fmt::ArgList& argList)
+void PrintWarningv(ConsoleChannel channel, std::string_view format, fmt::printf_args argList)
 {
 	// print the string directly
-	Printf(channel, "^3Warning: %s^7", fmt::sprintf(format, argList));
+	Printf(channel, "^3Warning: %s^7", fmt::vsprintf(format, argList));
 }
 
-void PrintError(ConsoleChannel channel, const char* format, const fmt::ArgList& argList)
+void PrintErrorv(ConsoleChannel channel, std::string_view format, fmt::printf_args argList)
 {
 	// print the string directly
-	Printf(channel, "^1Error: %s^7", fmt::sprintf(format, argList));
+	Printf(channel, "^1Error: %s^7", fmt::vsprintf(format, argList));
 }
 
 static ConVar<int> developerVariable(GetDefaultContext(), "developer", ConVar_Archive, 0, &g_useDeveloper);
@@ -144,4 +178,9 @@ static ConVar<int> developerVariable(GetDefaultContext(), "developer", ConVar_Ar
 extern "C" DLL_EXPORT void CoreAddPrintListener(void(*function)(ConsoleChannel, const char*))
 {
 	console::g_printListeners.push_back(function);
+}
+
+extern "C" DLL_EXPORT void CoreSetPrintFunction(void(*function)(const char*))
+{
+	console::g_printf = function;
 }

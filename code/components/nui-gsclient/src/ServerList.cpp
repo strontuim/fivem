@@ -14,6 +14,8 @@
 #include <fstream>
 #include <array>
 
+#include <CoreConsole.h>
+
 #include <NetAddress.h> // net:base
 
 #include <rapidjson/document.h>
@@ -258,19 +260,23 @@ void GSClient_QueryServer(gameserveritemext_t& server)
 	auto socket = (server.m_Address.GetAddressFamily() == AF_INET6) ? g_cls.socket6 : g_cls.socket;
 	
 	char message[128];
-	_snprintf(message, sizeof(message), "\xFF\xFF\xFF\xFFgetinfo xxx");
+	strcpy(message, "\xFF\xFF\xFF\xFFgetinfo xxx");
 
 	sendto(socket, message, strlen(message), 0, (sockaddr*)addr, addrlen);
 }
 
+static std::unique_ptr<ConVar<int>> ui_maxQueriesPerMinute;
+
 void GSClient_QueryStep()
 {
-	if ((GetTickCount() - g_cls.lastQueryStep) < 75)
+	if ((timeGetTime() - g_cls.lastQueryStep) < 250)
 	{
 		return;
 	}
 
-	g_cls.lastQueryStep = GetTickCount();
+	int queriesPerStep = round(ui_maxQueriesPerMinute->GetValue() / 60.0f / (1000.0f / 250.0f));
+
+	g_cls.lastQueryStep = timeGetTime();
 
 	int count = 0;
 
@@ -280,7 +286,7 @@ void GSClient_QueryStep()
 	{
 		if (!serverPair.second->queried)
 		{
-			if (count < 100)
+			if (count < queriesPerStep)
 			{
 				GSClient_QueryServer(*serverPair.second);
 				count++;
@@ -392,7 +398,7 @@ void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAd
 
 	server->responded = true;
 
-	replaceAll(server->m_hostName, "'", "\\'");
+	replaceAll(server->m_hostName, "\"", "\\\"");
 
 	const char* mapnameStr = Info_ValueForKey(buffer, "mapname");
 	const char* gametypeStr = Info_ValueForKey(buffer, "gametype");
@@ -410,8 +416,8 @@ void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAd
 		gametype = gametypeStr;
 	}
 
-	replaceAll(mapname, "'", "\\'");
-	replaceAll(gametype, "'", "\\'");
+	replaceAll(mapname, "\"", "\\\"");
+	replaceAll(gametype, "\"", "\\\"");
 
 	std::string addressStr = server->m_Address.ToString();
 
@@ -424,18 +430,21 @@ void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAd
 
 		bool isThisOneQuery = (g_cls.isOneQuery && from == g_cls.oneQueryAddress);
 
-		nui::ExecuteRootScript(fmt::sprintf("citFrames['mpMenu'].contentWindow.postMessage({ type: '%s', name: '%s',"
-			"mapname: '%s', gametype: '%s', clients: %d, maxclients: %d, ping: %d,"
-			"addr: '%s', infoBlob: %s }, '*');",
-			(isThisOneQuery) ? "serverQueried" : "serverAdd",
-			server->m_hostName,
-			mapname,
-			gametype,
-			server->m_clients,
-			server->m_maxClients,
-			server->m_ping,
-			addressStr,
-			infoBlobJson));
+		if (!doc.HasParseError() && nui::HasFrame("mpMenu"))
+		{
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "%s", "name": "%s",)"
+				R"("mapname": "%s", "gametype": "%s", "clients": "%d", "maxclients": %d, "ping": %d,)"
+				R"("addr": "%s", "infoBlob": %s })",
+				(isThisOneQuery) ? "serverQueried" : "serverAdd",
+				server->m_hostName,
+				mapname,
+				gametype,
+				server->m_clients,
+				server->m_maxClients,
+				server->m_ping,
+				addressStr,
+				infoBlobJson));
+		}
 
 		if (isThisOneQuery)
 		{
@@ -507,7 +516,7 @@ void GSClient_PollSocket(SOCKET socket)
 				buf[len] = '\0';
 			}
 
-			GSClient_HandleOOB(&buf[4], len - 4, net::PeerAddress((sockaddr*)&from, fromlen));
+			GSClient_HandleOOB(&buf[4], size_t(len) - 4, net::PeerAddress((sockaddr*)&from, fromlen));
 		}
 	}
 }
@@ -576,7 +585,78 @@ void GSClient_QueryAddresses(const TContainer& addrs)
 
 void GSClient_QueryOneServer(const std::wstring& arg)
 {
-	auto peerAddress = net::PeerAddress::FromString(ToNarrow(arg));
+	auto narrowArg = ToNarrow(arg);
+
+	if (narrowArg.find("cfx.re/join") != std::string::npos)
+	{
+		HttpRequestOptions ro;
+		ro.responseHeaders = std::make_shared<HttpHeaderList>();
+
+		Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("https://%s", narrowArg.substr(0, narrowArg.find_last_of(':'))), ro, [ro, narrowArg](bool success, const char* data, size_t callback)
+		{
+			if (success)
+			{
+				const auto& rh = *ro.responseHeaders;
+
+				if (rh.find("X-CitizenFX-Url") != rh.end())
+				{
+					auto url = rh.find("X-CitizenFX-Url")->second;
+
+					Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("%sdynamic.json", url), [url, narrowArg](bool success, const char* data, size_t size)
+					{
+						if (success)
+						{
+							std::string dynamicBlob{ data, size };
+
+							Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("%sinfo.json", url), [narrowArg, dynamicBlob](bool success, const char* data, size_t size)
+							{
+								if (success)
+								{
+									std::string infoBlobJson{ data, size };
+
+									rapidjson::Document dynDoc;
+									dynDoc.Parse(dynamicBlob.c_str(), dynamicBlob.size());
+
+									rapidjson::Document doc;
+									doc.Parse(infoBlobJson.c_str(), infoBlobJson.size());
+
+									if (!doc.HasParseError() && !dynDoc.HasParseError() && nui::HasFrame("mpMenu"))
+									{
+										std::string hostname = dynDoc["hostname"].GetString();
+										std::string mapname = dynDoc["mapname"].GetString();
+										std::string gametype = dynDoc["gametype"].GetString();
+
+										replaceAll(hostname, "\"", "\\\"");
+										replaceAll(mapname, "\"", "\\\"");
+										replaceAll(gametype, "\"", "\\\"");
+
+										nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "%s", "name": "%s",)"
+											R"("mapname": "%s", "gametype": "%s", "clients": "%d", "maxclients": %d, "ping": %d,)"
+											R"("addr": "%s", "infoBlob": %s })",
+											"serverQueried",
+											hostname,
+											mapname,
+											gametype,
+											dynDoc["clients"].GetInt(),
+											atoi(dynDoc["sv_maxclients"].GetString()),
+											42,
+											narrowArg,
+											infoBlobJson));
+									}
+								}
+							});
+						}
+					});
+
+					return;
+				}
+			}
+		});
+
+		return;
+	}
+
+	auto peerAddress = net::PeerAddress::FromString(narrowArg);
 
 	if (peerAddress)
 	{
@@ -586,7 +666,7 @@ void GSClient_QueryOneServer(const std::wstring& arg)
 	}
 	else
 	{
-		nui::ExecuteRootScript(fmt::sprintf("citFrames['mpMenu'].contentWindow.postMessage({ type: 'queryingFailed', arg: '%s' }, '*');", ToNarrow(arg)));
+		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "queryingFailed", "arg": "%s" })", ToNarrow(arg)));
 	}
 }
 
@@ -660,7 +740,12 @@ void GSClient_GetFavorites()
 	favFile >> json;
 	favFile.close();
 
-	nui::ExecuteRootScript(va("citFrames['mpMenu'].contentWindow.postMessage({ type: 'getFavorites', list: %s }, '*');", json));
+	if (json.empty())
+	{
+		json = "[]";
+	}
+
+	nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "getFavorites", "list": %s })", json));
 }
 
 void GSClient_SaveFavorites(const wchar_t *json)
@@ -672,6 +757,8 @@ void GSClient_SaveFavorites(const wchar_t *json)
 
 static InitFunction initFunction([] ()
 {
+	ui_maxQueriesPerMinute = std::make_unique<ConVar<int>>("ui_maxQueriesPerMinute", ConVar_Archive, 5000);
+
 	CreateDirectory(MakeRelativeCitPath(L"cache\\servers\\").c_str(), nullptr);
 
 	nui::OnInvokeNative.Connect([] (const wchar_t* type, const wchar_t* arg)

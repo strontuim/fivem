@@ -113,7 +113,11 @@ void MultiplexTcpChildServer::AttachToResult(const std::vector<uint8_t>& existin
 	stream->SetInitialData(existingData);
 
 	// keep a local reference to the connection
-	m_connections.insert(stream);
+	{
+		std::unique_lock<std::mutex> lock(m_connectionsMutex);
+
+		m_connections.insert(stream);
+	}
 
 	// invoke the connection callback
 	auto connectionCallback = GetConnectionCallback();
@@ -126,6 +130,8 @@ void MultiplexTcpChildServer::AttachToResult(const std::vector<uint8_t>& existin
 
 void MultiplexTcpChildServer::CloseStream(MultiplexTcpChildServerStream* stream)
 {
+	std::unique_lock<std::mutex> lock(m_connectionsMutex);
+
 	m_connections.erase(stream);
 }
 
@@ -192,6 +198,8 @@ void MultiplexTcpChildServerStream::CloseInternal()
 	SetReadCallback(TReadCallback());
 
 	m_server->CloseStream(this);
+
+	m_baseStream = nullptr;
 }
 
 void MultiplexTcpChildServerStream::Close()
@@ -210,22 +218,57 @@ void MultiplexTcpChildServerStream::Close()
 
 void MultiplexTcpChildServerStream::Write(const std::vector<uint8_t>& data)
 {
-	m_baseStream->Write(data);
+	if (m_baseStream.GetRef())
+	{
+		m_baseStream->Write(data);
+	}
 }
 
 void MultiplexTcpChildServerStream::Write(const std::string& data)
 {
-	m_baseStream->Write(data);
+	if (m_baseStream.GetRef())
+	{
+		m_baseStream->Write(data);
+	}
+}
+
+void MultiplexTcpChildServerStream::Write(std::vector<uint8_t>&& data)
+{
+	if (m_baseStream.GetRef())
+	{
+		m_baseStream->Write(std::move(data));
+	}
+}
+
+void MultiplexTcpChildServerStream::Write(std::string&& data)
+{
+	if (m_baseStream.GetRef())
+	{
+		m_baseStream->Write(std::move(data));
+	}
 }
 
 PeerAddress MultiplexTcpChildServerStream::GetPeerAddress()
 {
-	return m_baseStream->GetPeerAddress();
+	if (m_baseStream.GetRef())
+	{
+		return m_baseStream->GetPeerAddress();
+	}
+
+	return {};
 }
 
 void MultiplexTcpChildServerStream::SetInitialData(const std::vector<uint8_t>& initialData)
 {
 	m_initialData = initialData;
+}
+
+void MultiplexTcpChildServerStream::ScheduleCallback(const TScheduledCallback& callback)
+{
+	if (m_baseStream.GetRef())
+	{
+		m_baseStream->ScheduleCallback(callback);
+	}
 }
 
 fwRefContainer<TcpServer> MultiplexTcpServer::CreateServer(const MultiplexPatternMatchFn& patternMatchFunction)

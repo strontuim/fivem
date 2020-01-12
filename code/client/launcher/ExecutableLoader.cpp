@@ -9,11 +9,14 @@
 #include "ExecutableLoader.h"
 
 #include <Error.h>
+#include <Hooking.h>
 
 ExecutableLoader::ExecutableLoader(const uint8_t* origBinary)
 {
+	hook::set_base();
+
 	m_origBinary = origBinary;
-	m_loadLimit = UINT_MAX;
+	m_loadLimit = UINTPTR_MAX;
 	
 	SetLibraryLoader([] (const char* name)
 	{
@@ -101,7 +104,7 @@ void ExecutableLoader::LoadSection(IMAGE_SECTION_HEADER* section)
 	void* targetAddress = GetTargetRVA<uint8_t>(section->VirtualAddress);
 	const void* sourceAddress = m_origBinary + section->PointerToRawData;
 
-	if ((uintptr_t)targetAddress >= m_loadLimit)
+	if ((uintptr_t)targetAddress >= (m_loadLimit + hook::baseAddressDifference))
 	{
 		return;
 	}
@@ -111,10 +114,10 @@ void ExecutableLoader::LoadSection(IMAGE_SECTION_HEADER* section)
 		uint32_t sizeOfData = fwMin(section->SizeOfRawData, section->Misc.VirtualSize);
 
 		memcpy(targetAddress, sourceAddress, sizeOfData);
-
-		DWORD oldProtect;
-		VirtualProtect(targetAddress, sizeOfData, PAGE_EXECUTE_READWRITE, &oldProtect);
 	}
+
+	DWORD oldProtect;
+	VirtualProtect(targetAddress, section->Misc.VirtualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
 }
 
 void ExecutableLoader::LoadSections(IMAGE_NT_HEADERS* ntHeader)
@@ -228,6 +231,10 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 	IMAGE_DOS_HEADER* sourceHeader = (IMAGE_DOS_HEADER*)module;
 	IMAGE_NT_HEADERS* sourceNtHeader = GetTargetRVA<IMAGE_NT_HEADERS>(sourceHeader->e_lfanew);
 
+	auto origCheckSum = sourceNtHeader->OptionalHeader.CheckSum;
+	auto origTimeStamp = sourceNtHeader->FileHeader.TimeDateStamp;
+	auto origDebugDir = sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+
 #if defined(PAYNE)
 	IMAGE_TLS_DIRECTORY origTls = *GetTargetRVA<IMAGE_TLS_DIRECTORY>(sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 #endif
@@ -240,6 +247,12 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 	{
 		LoadSnapshot(ntHeader);
 	}
+
+	DWORD oldProtect;
+	VirtualProtect(sourceNtHeader, 0x1000, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+	sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+	ApplyRelocations();
 
 	LoadImports(ntHeader);
 
@@ -259,7 +272,10 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 		const IMAGE_TLS_DIRECTORY* targetTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 		const IMAGE_TLS_DIRECTORY* sourceTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 
-		*(DWORD*)(sourceTls->AddressOfIndex) = 0;
+		if (sourceTls->AddressOfIndex)
+		{
+			*(DWORD*)(sourceTls->AddressOfIndex) = 0;
+		}
 
 		// note: 32-bit!
 #if defined(_M_IX86)
@@ -268,11 +284,14 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 		LPVOID tlsBase = *(LPVOID*)__readgsqword(0x58);
 #endif
 
-		DWORD oldProtect;
-		VirtualProtect((void*)targetTls->StartAddressOfRawData, sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData, PAGE_READWRITE, &oldProtect);
+		if (sourceTls->StartAddressOfRawData)
+		{
+			DWORD oldProtect;
+			VirtualProtect((void*)targetTls->StartAddressOfRawData, sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData, PAGE_READWRITE, &oldProtect);
 
-		memcpy(tlsBase, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
-		memcpy((void*)targetTls->StartAddressOfRawData, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+			memcpy(tlsBase, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+			memcpy((void*)targetTls->StartAddressOfRawData, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+		}
 		/*#else
 			const IMAGE_TLS_DIRECTORY* targetTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 
@@ -284,14 +303,85 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 	m_entryPoint = GetTargetRVA<void>(ntHeader->OptionalHeader.AddressOfEntryPoint);
 
 	// copy over the offset to the new imports directory
-	DWORD oldProtect;
-	VirtualProtect(sourceNtHeader, 0x1000, PAGE_EXECUTE_READWRITE, &oldProtect);
-
 	sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
-#if defined(GTA_FIVE)
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 	memcpy(sourceNtHeader, ntHeader, sizeof(IMAGE_NT_HEADERS) + (ntHeader->FileHeader.NumberOfSections * (sizeof(IMAGE_SECTION_HEADER))));
 #endif
+
+	sourceNtHeader->OptionalHeader.CheckSum = origCheckSum;
+	sourceNtHeader->FileHeader.TimeDateStamp = origTimeStamp;
+
+	sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG] = origDebugDir;
+}
+
+bool ExecutableLoader::ApplyRelocations()
+{
+	IMAGE_DOS_HEADER* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(m_module);
+
+	IMAGE_NT_HEADERS* ntHeader = GetTargetRVA<IMAGE_NT_HEADERS>(dosHeader->e_lfanew);
+
+	IMAGE_DATA_DIRECTORY* relocationDirectory = &ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+	IMAGE_BASE_RELOCATION* relocation = GetTargetRVA<IMAGE_BASE_RELOCATION>(relocationDirectory->VirtualAddress);
+	IMAGE_BASE_RELOCATION* endRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>((char*)relocation + relocationDirectory->Size);
+
+	intptr_t relocOffset = reinterpret_cast<intptr_t>(m_module) - 0x140000000;
+
+	if (relocOffset == 0)
+	{
+		return true;
+	}
+
+	// loop
+	while (true)
+	{
+		// are we past the size?
+		if (relocation >= endRelocation)
+		{
+			break;
+		}
+
+		// is this an empty block?
+		if (relocation->SizeOfBlock == 0)
+		{
+			break;
+		}
+
+		// go through each and every relocation
+		size_t numRelocations = (relocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
+		uint16_t * relocStart = reinterpret_cast<uint16_t*>(relocation + 1);
+
+		for (size_t i = 0; i < numRelocations; i++)
+		{
+			uint16_t type = relocStart[i] >> 12;
+			uint32_t rva = (relocStart[i] & 0xFFF) + relocation->VirtualAddress;
+
+			void* addr = GetTargetRVA<void>(rva);
+			DWORD oldProtect;
+			VirtualProtect(addr, 4, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+			if (type == IMAGE_REL_BASED_HIGHLOW)
+			{
+				*reinterpret_cast<int32_t*>(addr) += relocOffset;
+			}
+			else if (type == IMAGE_REL_BASED_DIR64)
+			{
+				*reinterpret_cast<int64_t*>(addr) += relocOffset;
+			}
+			else if (type != IMAGE_REL_BASED_ABSOLUTE)
+			{
+				return false;
+			}
+
+			VirtualProtect(addr, 4, oldProtect, &oldProtect);
+		}
+
+		// on to the next one!
+		relocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>((char*)relocation + relocation->SizeOfBlock);
+	}
+
+	return true;
 }
 
 HMODULE ExecutableLoader::ResolveLibrary(const char* name)

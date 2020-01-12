@@ -1,64 +1,50 @@
-<section class="setting">
+<div *ngFor="let setting of settings">
+<section class="setting" *ngIf="setting.show">
 	<div class="key">
-		<div>Nickname</div>
+		<div>{{ setting.setting.name | translate:lang }}</div>
 	</div>
 	<div class="value">
-		<input
-			#input
-			class="text"
-			type="text"
-			placeholder="{{'#Settings_Nickname'|translate}}"
-			spellcheck="false"
-			[(ngModel)]="nickname"
-			(ngModelChange)="nameChanged($event)"
-		>
-	</div>
-</section>
-
-<section class="setting">
-	<div class="key">
-		<div>Dev mode</div>
-	</div>
-	<div class="value">
-		<div class="checkbox">
+		<div class="checkbox" *ngIf="setting.setting.type === 'checkbox'">
 			<input
 				type="checkbox"
-				id="dev-mode"
-				[checked]="devMode"
-				(change)="toggleDevMode()"
+				[id]="setting.setting.id"
+				[(ngModel)]="setting.boolValue"
+				[name]="setting.setting.id"
 			>
-			<label for="dev-mode">
-				Enables "localhost" menu item
+			<label [for]="setting.setting.id">
+				{{ setting.setting.description | translate:lang }}
 			</label>
 		</div>
-	</div>
-</section>
-
-<section class="setting" *ngIf="devMode">
-	<div class="key">
-		<div>Localhost port</div>
-	</div>
-	<div class="value">
 		<input
+			*ngIf="setting.setting.type === 'text'"
 			#input
 			class="text"
 			type="text"
-			placeholder="{{'#Settings_LocalhostPort'|translate}}"
+			[placeholder]="setting.setting.description | translate:lang"
 			spellcheck="false"
-			[(ngModel)]="localhostPort"
-			(ngModelChange)="localhostPortChanged($event)"		
+			[name]="setting.setting.id"
+			[(ngModel)]="setting.value"
 		>
-	</div>
-</section>
+		<span *ngIf="setting.setting.type === 'button'">
+			<button (click)="setting.setting.setCb('')">{{ setting.setting.description | translate:lang }}</button>
+		</span>
 
-<section class="setting">
-	<div class="key">
-		<div>Connected FiveM account</div>
-	</div>
-	<div class="value">
-		<span *ngIf="currentAccount">Linked: {{ currentAccount.username }}</span>
-		<span *ngIf="!currentAccount">
-			<button (click)="linkAccount()">Link</button>
+		<span *ngIf="setting.setting.type === 'label' && !setting.setting.colorizeValue">
+			{{ setting.label }}
+		</span>
+
+		<span *ngIf="setting.setting.type === 'label' && setting.setting.colorizeValue"
+			[innerHTML]="setting.label | escape | colorize">
+		</span>
+
+		<span *ngIf="setting.setting.type === 'select'">
+			<select
+				[(ngModel)]="setting.value"
+				[name]="setting.setting.id"
+			>
+				<option *ngFor="let option of setting.optionsArray" [value]="option.value">{{ option.name }}</option>
+			</select>
 		</span>
 	</div>
 </section>
+</div>

@@ -23,7 +23,9 @@
 
 #include <optional>
 
+#include <CfxState.h>
 #include <CfxSubProcess.h>
+#include <HostSharedData.h>
 
 #include <citversion.h>
 
@@ -44,7 +46,13 @@ static json load_json_file(const std::wstring& path)
 
 		fclose(f);
 
-		return json::parse(text);
+		try
+		{
+			return json::parse(text);
+		}
+		catch (std::exception& e)
+		{
+		}
 	}
 
 	return json(nullptr);
@@ -203,20 +211,23 @@ static void OverloadCrashData(TASKDIALOGCONFIG* config)
 			static ErrorData errData = std::get<ErrorData>(*data);
 			static uint64_t retAddr = std::get<uint64_t>(*data);
 
-			if (!errData.errorName.empty())
+			if (errData.errorName.empty())
 			{
-				static std::wstring errTitle = fmt::sprintf(L"RAGE error: %s", ToWide(errData.errorName));
-				static std::wstring errDescription = fmt::sprintf(L"A game error (at %016llx) caused " PRODUCT_NAME L" to stop working. "
-					L"A crash report has been uploaded to the " PRODUCT_NAME L" developers.\n"
-					L"If you require immediate support, please visit <A HREF=\"https://forum.fivem.net/\">FiveM.net</A> and mention the details below.\n\n%s",
-					retAddr,
-					ToWide(ParseLinks(errData.errorDescription)));
-
-				config->pszMainInstruction = errTitle.c_str();
-				config->pszContent = errDescription.c_str();
-
-				return;
+				errData.errorName = "UNKNOWN";
+				errData.errorDescription = "";
 			}
+
+			static std::wstring errTitle = fmt::sprintf(L"RAGE error: %s", ToWide(errData.errorName));
+			static std::wstring errDescription = fmt::sprintf(L"A game error (at %016llx) caused " PRODUCT_NAME L" to stop working. "
+				L"A crash report has been uploaded to the " PRODUCT_NAME L" developers.\n"
+				L"If you require immediate support, please visit <A HREF=\"https://forum.fivem.net/\">FiveM.net</A> and mention the details below.\n\n%s",
+				retAddr,
+				ToWide(ParseLinks(errData.errorDescription)));
+
+			config->pszMainInstruction = errTitle.c_str();
+			config->pszContent = errDescription.c_str();
+
+			return;
 		}
 	}
 
@@ -285,22 +296,6 @@ static std::string exWhat;
 static std::wstring GetAdditionalData()
 {
 	{
-		json error_pickup = load_error_pickup();
-
-		if (!error_pickup.is_null())
-		{
-			if (error_pickup["line"] != 99999)
-			{
-				error_pickup["type"] = "error_pickup";
-			}
-
-			add_crashometry(error_pickup);
-
-			return ToWide(error_pickup.dump());
-		}
-	}
-
-	{
 		auto errorData = LoadErrorData();
 
 		if (errorData)
@@ -315,6 +310,22 @@ static std::wstring GetAdditionalData()
 			add_crashometry(jsonData);
 
 			return ToWide(jsonData.dump());
+		}
+	}
+
+	{
+		json error_pickup = load_error_pickup();
+
+		if (!error_pickup.is_null())
+		{
+			if (error_pickup["line"] != 99999)
+			{
+				error_pickup["type"] = "error_pickup";
+			}
+
+			add_crashometry(error_pickup);
+
+			return ToWide(error_pickup.dump());
 		}
 	}
 
@@ -351,6 +362,22 @@ static std::wstring HashCrash(const std::wstring& key)
 		std::string{ wordList[(hash >>  8) & 0xFF] },
 		std::string{ wordList[(hash >> 16) & 0xFF] }
 	));
+}
+
+static std::wstring UnblameCrash(const std::wstring& hash)
+{
+	auto retval = hash;
+
+	if (_wcsnicmp(hash.c_str(), L"fivem.exe+", 10) == 0)
+	{
+		retval = L"GTA5+" + retval.substr(10);
+	}
+	else if (_wcsnicmp(hash.c_str(), L"redm.exe+", 9) == 0)
+	{
+		retval = L"RDR2+" + retval.substr(9);
+	}
+
+	return retval;
 }
 
 void NVSP_ShutdownSafely();
@@ -405,6 +432,29 @@ static DWORD RemoteExceptionFunc(LPVOID objectPtr)
 	}
 }
 
+static DWORD BeforeTerminateHandler(LPVOID arg)
+{
+	__try
+	{
+		auto coreRt = GetModuleHandleW(L"CoreRT.dll");
+
+		if (coreRt)
+		{
+			auto func = (void(*)(void*))GetProcAddress(coreRt, "CoreOnProcessAbnormalTermination");
+
+			if (func)
+			{
+				func(arg);
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+
+	return 0;
+}
+
 // c/p from ros-patches:five
 // #TODO: factor out sanely
 
@@ -444,6 +494,134 @@ std::string GetOwnershipPath()
 	}
 
 	return "";
+}
+
+#include "mz.h"
+#include "mz_os.h"
+#include "mz_strm.h"
+#include "mz_strm_buf.h"
+#include "mz_strm_split.h"
+#include "mz_zip.h"
+#include "mz_zip_rw.h"
+
+#include <wrl.h>
+
+namespace WRL = Microsoft::WRL;
+
+static std::wstring g_dumpPath;
+
+static HRESULT GetUIObjectOfFile(HWND hwnd, LPCWSTR pszPath, REFIID riid, void** ppv)
+{
+	*ppv = NULL;
+	HRESULT hr;
+	LPITEMIDLIST pidl;
+	SFGAOF sfgao;
+	if (SUCCEEDED(hr = SHParseDisplayName(pszPath, NULL, &pidl, 0, &sfgao))) {
+		IShellFolder* psf;
+		LPCITEMIDLIST pidlChild;
+		if (SUCCEEDED(hr = SHBindToParent(pidl, IID_IShellFolder,
+			(void**)& psf, &pidlChild))) {
+			hr = psf->GetUIObjectOf(hwnd, 1, &pidlChild, riid, NULL, ppv);
+			psf->Release();
+		}
+		CoTaskMemFree(pidl);
+	}
+	return hr;
+}
+
+struct TickCountData
+{
+	uint64_t tickCount;
+	SYSTEMTIME initTime;
+
+	TickCountData()
+	{
+		tickCount = GetTickCount64();
+		GetSystemTime(&initTime);
+	}
+};
+
+static void GatherCrashInformation()
+{
+	void* writer = nullptr;
+
+	SYSTEMTIME curTime;
+	GetSystemTime(&curTime);
+
+	std::wstring tempDir = _wgetenv(L"temp");
+	tempDir += fmt::sprintf(L"\\CfxCrashDump_%04d_%02d_%02d_%02d_%02d_%02d.zip", curTime.wYear, curTime.wMonth, curTime.wDay, curTime.wHour, curTime.wMinute, curTime.wSecond);
+
+	mz_zip_writer_create(&writer);
+	mz_zip_writer_set_compress_level(writer, 9);
+	mz_zip_writer_set_compress_method(writer, MZ_COMPRESS_METHOD_DEFLATE);
+
+	static HostSharedData<TickCountData> initTickCount("CFX_SharedTickCount");
+
+	bool success = false;
+	
+	int err = mz_zip_writer_open_file(writer, ToNarrow(tempDir).c_str(), 0, false);
+
+	if (err == MZ_OK)
+	{
+		static fwPlatformString dateStamp = fmt::sprintf(L"%04d-%02d-%02dT%02d%02d%02d", initTickCount->initTime.wYear, initTickCount->initTime.wMonth,
+			initTickCount->initTime.wDay, initTickCount->initTime.wHour, initTickCount->initTime.wMinute, initTickCount->initTime.wSecond);
+
+		static fwPlatformString fp = MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp));
+
+		err = mz_zip_writer_add_path(writer, ToNarrow(fp).c_str(), nullptr, false, false);
+
+		if (err == MZ_OK)
+		{
+			err = mz_zip_writer_add_path(writer, ToNarrow(g_dumpPath).c_str(), nullptr, false, false);
+
+			if (err == MZ_OK)
+			{
+				auto extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info.bin");
+
+				if (GetFileAttributesW(extraDumpPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+				{
+					mz_zip_writer_add_path(writer, ToNarrow(extraDumpPath).c_str(), nullptr, false, false);
+				}
+
+				extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info2.bin");
+
+				if (GetFileAttributesW(extraDumpPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+				{
+					mz_zip_writer_add_path(writer, ToNarrow(extraDumpPath).c_str(), nullptr, false, false);
+				}
+
+				success = true;
+			}
+		}
+	}
+
+	err = mz_zip_writer_close(writer);
+
+	if (err == MZ_OK)
+	{
+		if (success)
+		{
+			// open Explorer with the file selected
+			STARTUPINFOW si = { 0 };
+			si.cb = sizeof(si);
+
+			PROCESS_INFORMATION pi;
+
+			CreateProcessW(nullptr, const_cast<wchar_t*>(va(L"explorer /select,\"%s\"", tempDir)), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+
+			// initialize OLE
+			OleInitialize(nullptr);
+
+			// copy the file to the clipboard
+			WRL::ComPtr<IDataObject> dataObject;
+			GetUIObjectOfFile(nullptr, tempDir.c_str(), IID_PPV_ARGS(&dataObject));
+
+			OleSetClipboard(dataObject.Get());
+			OleFlushClipboard();
+		}
+	}
+
+	mz_zip_writer_delete(&writer);
 }
 
 #include <rapidjson/document.h>
@@ -510,13 +688,68 @@ bool LoadOwnershipTicket()
 	return false;
 }
 
+// copied here so that we don't have to rebuild Shared (and HostSharedData does not support custom names)
+struct MDSharedTickCount
+{
+	struct Data
+	{
+		uint64_t tickCount;
+
+		Data()
+		{
+			tickCount = GetTickCount64();
+		}
+	};
+
+	MDSharedTickCount()
+	{
+		m_data = &m_fakeData;
+
+		bool initTime = true;
+		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Data), L"CFX_SharedTickCount");
+
+		if (m_fileMapping != nullptr)
+		{
+			if (GetLastError() == ERROR_ALREADY_EXISTS)
+			{
+				initTime = false;
+			}
+
+			m_data = (Data*)MapViewOfFile(m_fileMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Data));
+
+			if (initTime)
+			{
+				m_data = new(m_data) Data();
+			}
+		}
+	}
+
+	inline Data& operator*()
+	{
+		return *m_data;
+	}
+
+	inline Data* operator->()
+	{
+		return m_data;
+	}
+
+private:
+	HANDLE m_fileMapping;
+	Data* m_data;
+
+	Data m_fakeData;
+};
 
 void InitializeDumpServer(int inheritedHandle, int parentPid)
 {
 	static bool g_running = true;
 
+	// needed to initialize logging(!)
+	trace("DumpServer is active and waiting.\n");
+
 	HANDLE inheritedHandleBit = (HANDLE)inheritedHandle;
-	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, parentPid);
+	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, parentPid);
 
 	CrashGenerationServer::OnClientConnectedCallback connectCallback = [] (void*, const ClientInfo* info)
 	{
@@ -526,6 +759,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 	CrashGenerationServer::OnClientDumpRequestCallback dumpCallback = [] (void*, const ClientInfo* info, const std::wstring* filePath)
 	{
 		auto process_handle = info->process_handle();
+		DWORD exceptionCode = 0;
 
 		{
 			EXCEPTION_POINTERS* ei;
@@ -600,6 +834,9 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 								}
 							}
 						}
+
+						// store exception code
+						exceptionCode = ex.ExceptionCode;
 
 						// try parsing any C++ exception
 						if (ex.ExceptionCode == 0xE06D7363 && ex.ExceptionInformation[0] == 0x19930520)
@@ -701,7 +938,23 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		}
 
 		parameters[L"ProductName"] = L"FiveM";
-		parameters[L"Version"] = va(L"1.3.0.%d", BASE_EXE_VERSION);
+
+		FILE* f = _wfopen(MakeRelativeCitPath(L"citizen/version.txt").c_str(), L"r");
+
+		if (f)
+		{
+			char ver[128];
+
+			fgets(ver, sizeof(ver), f);
+			fclose(f);
+
+			parameters[L"Version"] = va(L"1.3.0.%d", atoi(ver));
+		}
+		else
+		{
+			parameters[L"Version"] = va(L"1.3.0.%d", BASE_EXE_VERSION);
+		}
+
 		parameters[L"BuildID"] = L"20170101";
 		parameters[L"UserID"] = ToWide(g_entitlementSource);
 
@@ -715,13 +968,43 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		parameters[L"AdditionalData"] = GetAdditionalData();
 
+		{
+			static MDSharedTickCount tickCount;
+			parameters[L"StartTime"] = fmt::sprintf(L"%lld", _time64(nullptr) - ((GetTickCount64() - tickCount->tickCount) / 1000));
+		}
+
 		std::wstring responseBody;
 		int responseCode;
 
 		std::map<std::wstring, std::wstring> files;
 		files[L"upload_file_minidump"] = *filePath;
 
-		TerminateProcess(parentProcess, -2);
+		static HostSharedData<TickCountData> initTickCount("CFX_SharedTickCount");
+		static fwPlatformString dateStamp = fmt::sprintf(L"%04d-%02d-%02dT%02d%02d%02d", initTickCount->initTime.wYear, initTickCount->initTime.wMonth,
+			initTickCount->initTime.wDay, initTickCount->initTime.wHour, initTickCount->initTime.wMinute, initTickCount->initTime.wSecond);
+
+		static fwPlatformString fp = MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp));
+
+		files[L"upload_file_log"] = fp;
+
+		// avoid libcef.dll subprocess crashes terminating the entire job
+		bool shouldTerminate = true;
+		bool shouldUpload = true;
+
+		if (GetProcessId(parentProcess) != GetProcessId(info->process_handle()))
+		{
+			if (crashHash.find(L"libcef") != std::string::npos)
+			{
+				shouldTerminate = false;
+			}
+
+			// Chrome OOM situations (kOomExceptionCode)
+			if (exceptionCode == 0xE0000008)
+			{
+				shouldTerminate = false;
+				shouldUpload = false;
+			}
+		}
 
 		static std::wstring windowTitle = PRODUCT_NAME L" Error";
 		static std::wstring mainInstruction = PRODUCT_NAME L" has stopped working";
@@ -730,21 +1013,21 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		if (!crashHash.empty())
 		{
-			auto ch = HashCrash(crashHash);
+			auto ch = UnblameCrash(crashHash);
 
 			if (crashHash.find(L".exe") != std::string::npos)
 			{
 				windowTitle = fmt::sprintf(L"Error %s", ch);
 			}
 
-			mainInstruction = fmt::sprintf(L"\"%s\"", ch);
-			cuz = fmt::sprintf(L"A %s", ch);
+			mainInstruction = fmt::sprintf(L"%s", ch);
+			cuz = fmt::sprintf(L"An error at %s", ch);
 
 			json crashData = load_json_file(L"citizen/crash-data.json");
 
 			if (crashData.is_object())
 			{
-				auto cd = crashData.value(ToNarrow(ch), "");
+				auto cd = crashData.value(ToNarrow(HashCrash(ch)), "");
 
 				if (!cd.empty())
 				{
@@ -770,10 +1053,58 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			content += fmt::sprintf(L"\n\nException details: %s", ToWide(exWhat));
 		}
 
+		if (!crashHash.empty())
+		{
+			content += fmt::sprintf(L"\n\nLegacy crash hash: %s", HashCrash(crashHash));
+		}
+
+		if (shouldTerminate)
+		{
+			std::thread([]()
+			{
+				static HostSharedData<CfxState> hostData("CfxInitState");
+				HANDLE gameProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, hostData->gamePid);
+
+				if (!gameProcess)
+				{
+					gameProcess = parentProcess;
+				}
+
+				if (gameProcess)
+				{
+					std::string friendlyReason = ToNarrow(HashCrash(crashHash) + L" (" + UnblameCrash(crashHash) + L")");
+
+					if (!exType.empty())
+					{
+						friendlyReason = "Unhandled exception: " + exType;
+					}
+
+					friendlyReason = "Game crashed: " + friendlyReason;
+
+					LPVOID memPtr = VirtualAllocEx(gameProcess, NULL, friendlyReason.size() + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+					if (memPtr)
+					{
+						WriteProcessMemory(gameProcess, memPtr, friendlyReason.data(), friendlyReason.size() + 1, NULL);
+					}
+
+					HANDLE hThread = CreateRemoteThread(gameProcess, NULL, 0, BeforeTerminateHandler, memPtr, 0, NULL);
+
+					if (hThread)
+					{
+						WaitForSingleObject(hThread, 7500);
+						CloseHandle(hThread);
+					}
+				}
+
+				TerminateProcess(parentProcess, -2);
+			}).detach();
+		}
+
 		static std::optional<std::wstring> crashId;
 
 		static const TASKDIALOG_BUTTON buttons[] = {
-			{ 42, L"Close" }
+			{ 42, L"Save information\nGathers a file with crash information to copy and attach in a support request." }
 		};
 
 		static std::wstring tempSignature = fmt::sprintf(L"Crash signature: %s\nReport ID: ... [uploading?] (use Ctrl+C to copy)", crashHash);
@@ -786,11 +1117,13 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			content = ToWide(crashometry["kill_network_msg"]);
 		}
 
+		static std::thread saveThread;
+
 		static TASKDIALOGCONFIG taskDialogConfig = { 0 };
 		taskDialogConfig.cbSize = sizeof(taskDialogConfig);
 		taskDialogConfig.hInstance = GetModuleHandle(nullptr);
-		taskDialogConfig.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_EXPAND_FOOTER_AREA | TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER;
-		taskDialogConfig.dwCommonButtons = 0;
+		taskDialogConfig.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_EXPAND_FOOTER_AREA | TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER | TDF_USE_COMMAND_LINKS | TDF_EXPANDED_BY_DEFAULT;
+		taskDialogConfig.dwCommonButtons = TDCBF_CLOSE_BUTTON;
 		taskDialogConfig.cButtons = 1;
 		taskDialogConfig.pButtons = buttons;
 		taskDialogConfig.pszWindowTitle = windowTitle.c_str();
@@ -806,11 +1139,23 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			}
 			else if (type == TDN_BUTTON_CLICKED)
 			{
-				return S_OK;
+				if (wParam == 42)
+				{
+					SendMessage(hWnd, TDM_ENABLE_BUTTON, 42, 0);
+
+					saveThread = std::thread([]()
+					{
+						GatherCrashInformation();
+					});
+				}
+				else
+				{
+					return S_OK;
+				}
 			}
 			else if (type == TDN_CREATED)
 			{
-				SendMessage(hWnd, TDM_ENABLE_BUTTON, 42, 0);
+				SendMessage(hWnd, TDM_ENABLE_BUTTON, IDCLOSE, 0);
 				SendMessage(hWnd, TDM_SET_MARQUEE_PROGRESS_BAR, 1, 0);
 				SendMessage(hWnd, TDM_SET_PROGRESS_BAR_MARQUEE, 1, 15);
 			}
@@ -827,7 +1172,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 						SendMessage(hWnd, TDM_SET_PROGRESS_BAR_STATE, PBST_ERROR, 0);
 					}
 
-					SendMessage(hWnd, TDM_ENABLE_BUTTON, 42, 1);
+					SendMessage(hWnd, TDM_ENABLE_BUTTON, IDCLOSE, 1);
 					SendMessage(hWnd, TDM_SET_MARQUEE_PROGRESS_BAR, 0, 0);
 					SendMessage(hWnd, TDM_SET_PROGRESS_BAR_POS, 100, 0);
 					SendMessage(hWnd, TDM_SET_PROGRESS_BAR_STATE, PBST_NORMAL, 0);
@@ -843,9 +1188,14 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		trace("Process crash captured. Crash dialog content:\n%s\n%s\n", ToNarrow(taskDialogConfig.pszMainInstruction), ToNarrow(taskDialogConfig.pszContent));
 
+		g_dumpPath = *filePath;
+
 		auto thread = std::thread([=]()
 		{
-			TaskDialogIndirect(&taskDialogConfig, nullptr, nullptr, nullptr);
+			if (shouldTerminate)
+			{
+				TaskDialogIndirect(&taskDialogConfig, nullptr, nullptr, nullptr);
+			}
 		});
 
 		std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
@@ -859,7 +1209,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			uploadCrashes = (GetPrivateProfileInt(L"Game", L"DisableCrashUpload", 0, fpath.c_str()) != 1);
 		}
 
-		if (bigMemoryDump)
+		if (bigMemoryDump && shouldTerminate)
 		{
 			STARTUPINFOW si = { 0 };
 			si.cb = sizeof(si);
@@ -871,13 +1221,18 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			dumpPath.append(TEXT("-full.dmp"));
 
 			CreateProcessW(nullptr, const_cast<wchar_t*>(va(L"explorer /select,\"%s\"", dumpPath)), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+
+			CloseHandle(pi.hProcess);
+			CloseHandle(pi.hThread);
 		}
 
 		// upload the actual minidump file as well
 #ifdef GTA_NY
 		if (HTTPUpload::SendRequest(L"http://cr.citizen.re:5100/submit", parameters, files, nullptr, &responseBody, &responseCode))
 #elif defined(GTA_FIVE)
-		if (uploadCrashes && HTTPUpload::SendRequest(L"http://updater.fivereborn.com:1127/post", parameters, files, nullptr, &responseBody, &responseCode))
+		if (uploadCrashes && shouldUpload && HTTPUpload::SendRequest(L"http://updater.fivereborn.com:1127/post", parameters, files, nullptr, &responseBody, &responseCode))
+#else
+		if (false)
 #endif
 		{
 			trace("Crash report service returned %s\n", ToNarrow(responseBody));
@@ -892,6 +1247,14 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		{
 			thread.join();
 		}
+
+		if (saveThread.joinable())
+		{
+			saveThread.join();
+		}
+
+		_wunlink(MakeRelativeCitPath(L"cache\\extra_dump_info.bin").c_str());
+		_wunlink(MakeRelativeCitPath(L"cache\\extra_dump_info2.bin").c_str());
 	};
 
 	CrashGenerationServer::OnClientExitedCallback exitCallback = [] (void*, const ClientInfo* info)
@@ -914,7 +1277,13 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		WaitForSingleObject(parentProcess, INFINITE);
 	}
 
+	// at this point we can safely perform some cleanup tasks, no matter whether the game exited cleanly or crashed
+
+	// revert NVSP disablement
 	NVSP_ShutdownSafely();
+
+	// delete steam_appid.txt on last process exit to curb paranoia about MTL mod checks
+	_wunlink(MakeRelativeGamePath(L"steam_appid.txt").c_str());
 }
 
 namespace google_breakpad

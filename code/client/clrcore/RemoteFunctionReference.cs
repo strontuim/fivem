@@ -75,21 +75,33 @@ namespace CitizenFX.Core
 		[SecurityCritical]
 		private byte[] _InvokeNative(byte[] argsSerialized)
 		{
-			IntPtr resBytes;
-			long retLength;
-
-			unsafe
+			if (GameInterface.SnapshotStackBoundary(out var b))
 			{
-				fixed (byte* argsSerializedRef = &argsSerialized[0])
-				{
-					resBytes = Native.Function.Call<IntPtr>(Native.Hash.INVOKE_FUNCTION_REFERENCE, m_reference, argsSerializedRef, argsSerialized.Length, &retLength);
-				}
+				InternalManager.ScriptHost.SubmitBoundaryEnd(b, b.Length);
 			}
 
-			var retval = new byte[retLength];
-			Marshal.Copy(resBytes, retval, 0, retval.Length);
+			try
+			{
+				IntPtr resBytes;
+				long retLength;
 
-			return retval;
+				unsafe
+				{
+					fixed (byte* argsSerializedRef = &argsSerialized[0])
+					{
+						resBytes = Native.Function.Call<IntPtr>(Native.Hash.INVOKE_FUNCTION_REFERENCE, m_reference, argsSerializedRef, argsSerialized.Length, &retLength);
+					}
+				}
+
+				var retval = new byte[retLength];
+				Marshal.Copy(resBytes, retval, 0, retval.Length);
+
+				return retval;
+			}
+			finally
+			{
+				InternalManager.ScriptHost.SubmitBoundaryEnd(null, 0);
+			}
 		}
 	}
 

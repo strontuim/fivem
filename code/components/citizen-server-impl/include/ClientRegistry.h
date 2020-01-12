@@ -1,5 +1,7 @@
 #pragma once
 
+#include <shared_mutex>
+
 #include <Client.h>
 #include <ComponentHolder.h>
 
@@ -45,11 +47,19 @@ namespace fx
 				m_clientsBySlotId[client->GetSlotId()].reset();
 			}
 
-			m_clients[client->GetGuid()] = nullptr;
+			{
+				std::unique_lock<std::shared_mutex> lock(m_clientsMutex);
+				m_clients[client->GetGuid()] = nullptr;
+			}
+
+			// unassign slot ID
+			client->SetSlotId(-1);
 		}
 
 		inline std::shared_ptr<Client> GetClientByGuid(const std::string& guid)
 		{
+			std::shared_lock<std::shared_mutex> lock(m_clientsMutex);
+
 			auto ptr = std::shared_ptr<Client>();
 			auto it = m_clients.find(guid);
 
@@ -125,6 +135,14 @@ namespace fx
 			return ptr;
 		}
 
+		inline std::shared_ptr<Client> GetClientBySlotID(uint32_t slotId)
+		{
+			assert(slotId < m_clientsBySlotId.size());
+
+			auto weakPtr = m_clientsBySlotId[slotId];
+			return weakPtr.lock();
+		}
+
 		inline std::shared_ptr<Client> GetClientByConnectionToken(const std::string& token)
 		{
 			auto ptr = std::shared_ptr<Client>();
@@ -141,15 +159,26 @@ namespace fx
 			return ptr;
 		}
 
-		inline void ForAllClients(const std::function<void(const std::shared_ptr<Client>&)>& cb)
+		template<typename TFn>
+		inline void ForAllClients(TFn&& cb)
 		{
+			m_clientsMutex.lock_shared();
+
 			for (auto& client : m_clients)
 			{
-				if (client.second)
+				auto cl = client.second;
+
+				m_clientsMutex.unlock_shared();
+
+				if (cl)
 				{
-					cb(client.second);
+					cb(cl);
 				}
+
+				m_clientsMutex.lock_shared();
 			}
+
+			m_clientsMutex.unlock_shared();
 		}
 
 		std::shared_ptr<Client> GetHost();
@@ -173,6 +202,9 @@ namespace fx
 		tbb::concurrent_unordered_map<std::string, std::weak_ptr<Client>> m_clientsByTcpEndPoint;
 		tbb::concurrent_unordered_map<std::string, std::weak_ptr<Client>> m_clientsByConnectionToken;
 		tbb::concurrent_unordered_map<int, std::weak_ptr<Client>> m_clientsByPeer;
+
+		// pending C++20 std::atomic overloads, again
+		std::shared_mutex m_clientsMutex;
 
 		std::vector<std::weak_ptr<Client>> m_clientsBySlotId;
 

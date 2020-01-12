@@ -4,19 +4,27 @@
 	(sort)="updateSorting($event)"
 ></servers-list-header>
 
-<div class="list">
+<div class="list" *ngIf="isBrowser()" #list>
 	<virtual-scroller
+		#scroll
 		[items]="sortedServers"
-		(update)="localServers = $event"
-		[bufferAmount]="15"
+		[bufferAmount]="25"
 		[stripedTable]="true"
+		[executeRefreshOutsideAngularZone]="true"
+		[scrollThrottlingTime]="100"
+		(vsUpdate)="changeDetectorRef.detectChanges()"
 	>
 		<div class="dummy"></div>
 		<servers-list-item
 			[class.premium]="isPremium(server)" [class.argentum]="getPremium(server) == 'ag'"
 			[class.aurum]="getPremium(server) == 'au'"  [class.platinum]="getPremium(server) == 'pt'"
 			[class.pinned]="isPinned(server)" [server]="server"
-			*ngFor="let server of localServers"
+			*ngFor="let server of scroll.viewPortItems; trackBy: svTrack"
 		></servers-list-item>
 	</virtual-scroller>
+</div>
+
+<!-- maybe re-enable this spinner? -->
+<div class="spinner" *ngIf="isSpinning && false">
+<div class="sbl-circ-ripple"></div>
 </div>

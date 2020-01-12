@@ -1,5 +1,6 @@
 #include <StdInc.h>
 
+#ifdef GTA_FIVE
 #include <LegitimacyAPI.h>
 
 #include <websocketpp/config/asio_no_tls_client.hpp>
@@ -7,7 +8,7 @@
 
 #include <json.hpp>
 
-#include <network/uri.hpp>
+#include <skyr/url.hpp>
 
 #include <HttpClient.h>
 
@@ -108,6 +109,8 @@ static HookFunction initFunction([]()
 										{ "authorize", true }
 									});
 
+									c.close(hdl, 0, "OK");
+
 									HttpRequestOptions options;
 									options.headers.insert({ "Content-Type", "application/json" });
 									options.headers.insert({ "Authorization", token });
@@ -127,12 +130,11 @@ static HookFunction initFunction([]()
 
 												if (!location.empty())
 												{
-													std::error_code ec;
-													auto uri = network::make_uri(location, ec);
+													auto uri = skyr::make_url(location);
 													
-													if (!ec)
+													if (uri)
 													{
-														auto queryStr = uri.query().to_string();
+														auto queryStr = uri->search();
 														queryStr = queryStr.substr(queryStr.find_first_of("=") + 1);
 
 														Instance<::HttpClient>::Get()->DoPostRequest(
@@ -171,3 +173,4 @@ static HookFunction initFunction([]()
 		}
 	}).detach();
 });
+#endif

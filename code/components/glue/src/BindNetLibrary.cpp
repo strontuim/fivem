@@ -12,12 +12,14 @@
 #include <GameInit.h>
 #include <nutsnbolts.h>
 
+#include <DrawCommands.h>
+#include <FontRenderer.h>
+
 #include <msgpack.hpp>
 
 #include <CoreConsole.h>
 #include <se/Security.h>
 
-#ifdef GTA_FIVE
 static InitFunction initFunction([] ()
 {
 	seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.internal" }, se::Object{ "builtin" }, se::AccessType::Allow);
@@ -25,6 +27,29 @@ static InitFunction initFunction([] ()
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* library)
 	{
 		static NetLibrary* netLibrary = library;
+		static std::string netLibWarningMessage;
+		static std::mutex netLibWarningMessageLock;
+
+		library->OnConnectOKReceived.Connect([](NetAddress)
+		{
+			std::unique_lock<std::mutex> lock(netLibWarningMessageLock);
+			netLibWarningMessage = "";
+		});
+
+		library->OnReconnectProgress.Connect([](const std::string& msg)
+		{
+			std::unique_lock<std::mutex> lock(netLibWarningMessageLock);
+			netLibWarningMessage = msg;
+		});
+
+		OnPostFrontendRender.Connect([]()
+		{
+			if (!netLibWarningMessage.empty())
+			{
+				std::unique_lock<std::mutex> lock(netLibWarningMessageLock);
+				TheFonts->DrawText(ToWide(netLibWarningMessage), CRect(40.0f, 40.0f, 800.0f, 500.0f), CRGBA(255, 0, 0, 255), 40.0f, 1.0f, "Comic Sans MS");
+			}
+		});
 
 		library->OnStateChanged.Connect([] (NetLibrary::ConnectionState curState, NetLibrary::ConnectionState lastState)
 		{
@@ -55,7 +80,15 @@ static InitFunction initFunction([] ()
 
 		OnKillNetwork.Connect([=] (const char* message)
 		{
+			{
+				std::unique_lock<std::mutex> lock(netLibWarningMessageLock);
+				netLibWarningMessage = "";
+			}
+
 			library->Disconnect(message);
+
+			Instance<ICoreGameInit>::Get()->ClearVariable("storyMode");
+			Instance<ICoreGameInit>::Get()->ClearVariable("localMode");
 		});
 
 		OnKillNetworkDone.Connect([=]()
@@ -93,4 +126,3 @@ static InitFunction initFunction([] ()
 		g_gameInit.SetGameLoaded();
 	});
 });
-#endif

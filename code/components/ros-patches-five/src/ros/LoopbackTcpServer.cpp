@@ -11,7 +11,16 @@
 #include <ros/LoopbackTcpServer.h>
 #include <IteratorView.h>
 
+#include <LaunchMode.h>
 #include <CfxSubProcess.h>
+
+#ifdef GTA_FIVE
+#define PIPE_NAME L"\\\\.\\pipe\\GTAVLauncher_Pipe"
+#define PIPE_NAME_NARROW "\\\\.\\pipe\\GTAVLauncher_Pipe"
+#else
+#define PIPE_NAME L"\\\\.\\pipe\\RDR2Launcher_Pipe"
+#define PIPE_NAME_NARROW "\\\\.\\pipe\\RDR2Launcher_Pipe"
+#endif
 
 #define REMOVE_EVENT_INSTANTLY (1 << 16)
 
@@ -177,6 +186,8 @@ bool LoopbackTcpServerManager::GetAddrInfoA(const char* name, const char* servic
 
 bool LoopbackTcpServerManager::GetAddrInfo(const char* name, const wchar_t* serviceName, const ADDRINFOW* hints, ADDRINFOW** addrInfo, int* outValue)
 {
+	//trace("getaddrinfo %s\n", name);
+
 	scoped_lock lock(m_loopbackLock);
 
 	// hash the hostname for lookup in the server dictionary
@@ -600,10 +611,10 @@ static int(__stdcall* g_oldWSARecv)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, L
 static int(__stdcall* g_oldWSASend)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 static int(__stdcall* g_oldWSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 
-#include <experimental/filesystem>
+#include <filesystem>
 #include <psapi.h>
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 
 struct ModuleData
 {
@@ -654,7 +665,7 @@ private:
 			while (it != end)
 			{
 				// gta-net-five hooks select() after us, so our hook will think any caller is Cfx
-				if (it->path().extension() == ".dll" && it->path().filename() != "gta-net-five.dll")
+				if (it->path().extension() == ".dll" && it->path().filename() != "gta-net-five.dll" && it->path().filename() != "gta-net-rdr3.dll")
 				{
 					HMODULE hMod = GetModuleHandle(it->path().c_str());
 
@@ -1107,97 +1118,7 @@ static BOOL __stdcall EP_CallbackMayRunLong(PTP_CALLBACK_INSTANCE cb)
 
 #include <sstream>
 
-struct EnvVarComparator : std::binary_function<std::wstring, std::wstring, bool>
-{
-	bool operator()(const std::wstring& left, const std::wstring& right) const
-	{
-		return _wcsicmp(left.c_str(), right.c_str()) < 0;
-	}
-};
-
-typedef std::map<std::wstring, std::wstring, EnvVarComparator> EnvironmentMap;
-
-static void ParseEnvironmentBlock(const wchar_t* block, EnvironmentMap& out)
-{
-	const wchar_t* p = block;
-
-	std::wstringstream curString;
-
-	std::wstring curKey;
-	std::wstring curValue;
-
-	bool inKey = true;
-	bool firstKeyChar = true;
-
-	while (true)
-	{
-		wchar_t curChar = *p;
-
-		if (inKey)
-		{
-			if (curChar == L'\0')
-			{
-				break;
-			}
-			else if (curChar == L'=' && !firstKeyChar)
-			{
-				curKey = curString.str();
-				curString.str(L"");
-				curString.clear();
-
-				inKey = false;
-			}
-			else
-			{
-				curString << curChar;
-			}
-
-			firstKeyChar = false;
-		}
-		else
-		{
-			if (curChar == L'\0')
-			{
-				curValue = curString.str();
-				curString.str(L"");
-				curString.clear();
-
-				out[curKey] = curValue;
-
-				inKey = true;
-				firstKeyChar = true;
-			}
-			else
-			{
-				curString << curChar;
-			}
-		}
-
-		p++;
-	}
-}
-
-static void BuildEnvironmentBlock(const EnvironmentMap& map, std::vector<wchar_t>& outBlock)
-{
-	outBlock.clear();
-
-	for (auto& pair : map)
-	{
-		// write the key
-		outBlock.insert(outBlock.end(), pair.first.cbegin(), pair.first.cend());
-
-		// equals symbol
-		outBlock.push_back(L'=');
-
-		// value
-		outBlock.insert(outBlock.end(), pair.second.cbegin(), pair.second.cend());
-
-		// null terminator
-		outBlock.push_back(L'\0');
-	}
-
-	outBlock.push_back(L'\0');
-}
+#include <EnvironmentBlockHelpers.h>
 
 static BOOL(*g_oldCreateProcessW)(const wchar_t* applicationName, wchar_t* commandLine, SECURITY_ATTRIBUTES* processAttributes, SECURITY_ATTRIBUTES* threadAttributes,
 								  BOOL inheritHandles, DWORD creationFlags, void* environment, const wchar_t* currentDirectory, STARTUPINFOW* startupInfo,
@@ -1217,6 +1138,7 @@ static BOOL __stdcall EP_CreateProcessW(const wchar_t* applicationName, wchar_t*
 	HMODULE socialClubLib = GetModuleHandle(L"socialclub.dll");
 
 	bool isSubprocess = wcsstr(commandLine, L"subprocess.exe") || StrStrIW(commandLine, L"SocialClubHelper.exe");
+	bool isService = wcsstr(commandLine, L"RockstarService.exe");
 
 	if (/*socialClubLib && */applicationName || isSubprocess)
 	{
@@ -1295,11 +1217,67 @@ static BOOL __stdcall EP_CreateProcessW(const wchar_t* applicationName, wchar_t*
 
 			return retval;
 		}
+
+		if (isService ||
+			boost::filesystem::path(applicationName).filename() == "RockstarService.exe")
+		{
+			BOOL retval;
+
+			// parse the existing environment block
+			EnvironmentMap environmentMap;
+
+			{
+				wchar_t* environmentStrings = GetEnvironmentStrings();
+
+				ParseEnvironmentBlock(environmentStrings, environmentMap);
+
+				FreeEnvironmentStrings(environmentStrings);
+			}
+
+			// insert tool mode value
+			environmentMap[L"CitizenFX_ToolMode"] = L"1";
+
+			// output the environment into a new block
+			std::vector<wchar_t> newEnvironment;
+
+			BuildEnvironmentBlock(environmentMap, newEnvironment);
+
+			auto fxApplicationName = MakeCfxSubProcess(L"ROSService");
+
+			// set the command line
+			const wchar_t* newCommandLine = va(L"\"%s\" ros:service", fxApplicationName, commandLine);
+
+			// and go create the new fake process
+			retval = g_oldCreateProcessW(fxApplicationName, const_cast<wchar_t*>(newCommandLine), processAttributes, threadAttributes, inheritHandles, creationFlags & (~CREATE_SUSPENDED) | CREATE_UNICODE_ENVIRONMENT, &newEnvironment[0], currentDirectory, startupInfo, information);
+
+			if (!retval)
+			{
+				auto error = GetLastError();
+
+				trace("Creating service failed - %d\n", error);
+			}
+			else
+			{
+				trace("Got ROS service - pid %d\n", information->dwProcessId);
+			}
+
+			information->hThread = NULL;
+			information->hProcess = CreateEventW(NULL, TRUE, FALSE, L"Cfx_ROSServiceEvent");
+
+			// unset the environment variable
+			//SetEnvironmentVariable(L"CitizenFX_ToolMode", L"0");
+
+			return retval;
+
+			//static auto an = MakeRelativeCitPath(L"cache\\game\\launcher\\RockstarService.exe");
+
+			//applicationName = an.c_str();
+		}
 	}
 
 	if (applicationName)
 	{
-		if (boost::filesystem::path(applicationName).filename() == L"GTA5.exe")
+		if (boost::filesystem::path(applicationName).filename() == L"GTA5.exe" || boost::filesystem::path(applicationName).filename() == L"RDR2.exe")
 		{
 			HANDLE hEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, L"CitizenFX_GTA5_ClearedForLaunch");
 
@@ -1309,14 +1287,14 @@ static BOOL __stdcall EP_CreateProcessW(const wchar_t* applicationName, wchar_t*
 				CloseHandle(hEvent);
 			}
 
-			for (auto& subProcess : g_subProcessHandles)
+			/*for (auto& subProcess : g_subProcessHandles)
 			{
 				HANDLE hSub = OpenProcess(PROCESS_TERMINATE, FALSE, subProcess);
 				TerminateProcess(hSub, 42);
 				CloseHandle(hSub);
 
                 g_subProcessHandles.resize(42);
-			}
+			}*/
 
 			HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, g_rosParentPid);
 
@@ -1331,7 +1309,8 @@ static BOOL __stdcall EP_CreateProcessW(const wchar_t* applicationName, wchar_t*
 			}
 
 			// disable D3D present function
-			hook::return_function(hook::get_pattern("89 74 24 20 44 8D 4E 01 45 33 C0 33 D2 FF", -0x6C));
+			// TODO for MTL
+			//hook::return_function(hook::get_pattern("89 74 24 20 44 8D 4E 01 45 33 C0 33 D2 FF", -0x6C));
 
 			std::thread([=] ()
 			{
@@ -1366,7 +1345,7 @@ void WaitForLauncher()
 void RunLauncher(const wchar_t* toolName, bool instantWait)
 {
 	// early out if the launcher pipe already exists
-	if (WaitNamedPipe(L"\\\\.\\pipe\\GTAVLauncher_Pipe", 15) != 0)
+	if (WaitNamedPipe(PIPE_NAME, 15) != 0)
 	{
 		trace("Already found a GTAVLauncher_Pipe, not starting child launcher.\n");
 
@@ -1399,7 +1378,8 @@ void RunLauncher(const wchar_t* toolName, bool instantWait)
 	auto fxApplicationName = MakeCfxSubProcess(L"ROSLauncher");
 
 	// set the command line
-	const wchar_t* newCommandLine = va(L"\"%s\" %s --parent_pid=%d \"%s\"", fxApplicationName, toolName, GetCurrentProcessId(), MakeRelativeGamePath(L"GTAVLauncher.exe").c_str());
+	//const wchar_t* newCommandLine = va(L"\"%s\" %s --parent_pid=%d \"%s\"", fxApplicationName, toolName, GetCurrentProcessId(), MakeRelativeGamePath(L"GTAVLauncher.exe").c_str());
+	const wchar_t* newCommandLine = va(L"\"%s\" %s --parent_pid=%d \"%s\"", fxApplicationName, toolName, GetCurrentProcessId(), L"C:\\program files\\rockstar games\\launcher\\launcher.exe");
 
 	// create a waiting event
 	HANDLE hEvent = CreateEvent(nullptr, TRUE, FALSE, L"CitizenFX_GTA5_ClearedForLaunch");
@@ -1433,6 +1413,7 @@ void RunLauncher(const wchar_t* toolName, bool instantWait)
         if (instantWait)
         {
             g_waitForLauncherCB();
+			ResetEvent(hEvent);
         }
 	}
 }
@@ -1507,8 +1488,12 @@ static HANDLE(__stdcall* g_oldCreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTR
 
 static hook::cdecl_stub<void(int, int)> setupLoadingScreens([]()
 {
+#if defined(GTA_FIVE)
 	// trailing byte differs between 323 and 505
 	return hook::get_call(hook::get_pattern("8D 4F 08 33 D2 E8 ? ? ? ? C6", 5));
+#else
+	return (void*)0;
+#endif
 });
 
 static HANDLE __stdcall CreateFileAStub(
@@ -1520,17 +1505,33 @@ static HANDLE __stdcall CreateFileAStub(
 	_In_     DWORD                 dwFlagsAndAttributes,
 	_In_opt_ HANDLE                hTemplateFile)
 {
-	if (strcmp(lpFileName, "\\\\.\\pipe\\GTAVLauncher_Pipe") == 0)
+	if (strcmp(lpFileName, PIPE_NAME_NARROW) == 0)
 	{
 		trace("Opening GTAVLauncher_Pipe, waiting for launcher to load...\n");
 
-		WaitNamedPipe(L"\\\\.\\pipe\\GTAVLauncher_Pipe", INFINITE);
+		WaitNamedPipe(PIPE_NAME, INFINITE);
 		WaitForLauncher();
 
 		trace("Launcher is fine, continuing!\n");
 	}
+	else if (strcmp(lpFileName, "\\\\.\\pipe\\MTLService_Pipe") == 0)
+	{
+		lpFileName = "\\\\.\\pipe\\MTLService_Pipe_CFX";
+	}
 
 	return g_oldCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+static HANDLE(*g_oldOpenFileMappingA)(_In_ DWORD dwDesiredAccess, _In_ BOOL bInheritHandle, _In_ LPCSTR lpName);
+
+static HANDLE OpenFileMappingAStub(_In_ DWORD dwDesiredAccess, _In_ BOOL bInheritHandle, _In_ LPCSTR lpName)
+{
+	if (lpName && strstr(lpName, "MTLService_FileMapping"))
+	{
+		lpName = "MTLService_FileMapping_CFX";
+	}
+
+	return g_oldOpenFileMappingA(dwDesiredAccess, bInheritHandle, lpName);
 }
 
 static BOOL(*g_oldWriteFile)(_In_ HANDLE hFile, _In_reads_bytes_opt_(nNumberOfBytesToWrite) LPCVOID lpBuffer, _In_ DWORD nNumberOfBytesToWrite, _Out_opt_ LPDWORD lpNumberOfBytesWritten, _Inout_opt_ LPOVERLAPPED lpOverlapped);
@@ -1580,7 +1581,12 @@ static InitFunction hookFunction([] ()
 	DO_HOOK(L"ws2_32.dll", "GetAddrInfoW", EP_GetAddrInfoW, g_oldGetAddrInfoW);
 	DO_HOOK(L"ws2_32.dll", "GetAddrInfoExW", EP_GetAddrInfoExW, g_oldGetAddrInfoExW);
 //	DO_HOOK(L"ws2_32.dll", "FreeAddrInfoW", EP_FreeAddrInfoW, g_oldFreeAddrInfoW); // these three are hook-checked
-//	DO_HOOK(L"ws2_32.dll", "getaddrinfo", EP_GetAddrInfo, g_oldGetAddrInfo); // enabled because wine, probably going to fail
+
+	if (CfxIsWine())
+	{
+		DO_HOOK(L"ws2_32.dll", "getaddrinfo", EP_GetAddrInfo, g_oldGetAddrInfo); // enabled because wine, probably going to fail
+	}
+
 //	DO_HOOK(L"ws2_32.dll", "freeaddrinfo", EP_FreeAddrInfo, g_oldFreeAddrInfo);
  	DO_HOOK(L"ws2_32.dll", "WSALookupServiceBeginW", EP_WSALookupServiceBeginW, g_oldLookupService);
 	DO_HOOK(L"ws2_32.dll", "WSAEventSelect", EP_WSAEventSelect, g_oldEventSelect);
@@ -1613,6 +1619,7 @@ static InitFunction hookFunction([] ()
 	DO_HOOK(L"wininet.dll", "InternetOpenW", EP_InternetOpenW, g_oldInternetOpenW);
 
 	DO_HOOK(L"kernel32.dll", "CreateFileA", CreateFileAStub, g_oldCreateFileA);
+	DO_HOOK(L"kernel32.dll", "OpenFileMappingA", OpenFileMappingAStub, g_oldOpenFileMappingA);
 	DO_HOOK(L"kernel32.dll", "WriteFile", WriteFileStub, g_oldWriteFile);
 
 	trace("hello from %s\n", GetCommandLineA());
@@ -1642,10 +1649,12 @@ inline void NopAndSetCall(TFn* fn, T loc)
 
 static HookFunction hookFunction2([]()
 {
+#ifdef GTA_FIVE
 	auto loc = hook::get_pattern<char>("33 C9 E8 ? ? ? ? 41 8B CE E8 ? ? ? ? 41", 10);
 	NopAndSetCall(&g_origRlineInit, loc);
 	NopAndSetCall(&g_origCloudInit, loc + 8);
 	NopAndSetCall(&g_origTextureInit, hook::get_pattern("C7 45 38 99 3B 6D F6", 19));
 
 	hook::call(hook::get_pattern("8D 4A 03 E8 ? ? ? ? E8 ? ? ? ? 84 C0 75", 8), InitRlineWrap);
+#endif
 });

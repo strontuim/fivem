@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include <array>
+#include <optional>
+
 #include <NetAddress.h>
 #include <ppltasks.h>
 
@@ -32,8 +35,31 @@ enum class MumbleVoiceLikelihood
 	HighLikelihood
 };
 
+struct VoiceTargetConfig
+{
+	struct Target
+	{
+		std::vector<std::string> users;
+		std::string channel;
+		// ACL is not supported in umurmur, so does not count
+		bool links;
+		bool children;
+
+		inline Target()
+			: links(false), children(false)
+		{
+
+		}
+	};
+
+	std::vector<Target> targets;
+};
+
 class IMumbleClient : public fwRefCountable
 {
+public:
+	using TPositionHook = std::function<std::optional<std::array<float, 3>>(const std::string&)>;
+
 public:
 	virtual void Initialize() = 0;
 
@@ -49,13 +75,21 @@ public:
 
 	virtual void SetChannel(const std::string& channelName) = 0;
 
+	virtual void SetClientVolumeOverride(const std::string& clientName, float volume) = 0;
+
 	virtual void GetTalkers(std::vector<std::string>* names) = 0;
+
+	virtual void SetPositionHook(const TPositionHook& hook) = 0;
 
 	virtual void SetAudioDistance(float distance) = 0;
 
 	virtual void SetActorPosition(float position[3]) = 0;
 
 	virtual void SetListenerMatrix(float position[3], float front[3], float up[3]) = 0;
+
+	virtual void UpdateVoiceTarget(int idx, const VoiceTargetConfig& config) = 0;
+
+	virtual void SetVoiceTarget(int idx) = 0;
 
 	// settings
 	virtual void SetActivationMode(MumbleActivationMode mode) = 0;

@@ -88,7 +88,7 @@ bool IsModule(void* address)
 
 typedef NTSTATUS(*NtQueryInformationProcessType)(IN HANDLE ProcessHandle, IN PROCESSINFOCLASS ProcessInformationClass, OUT PVOID ProcessInformation, IN ULONG ProcessInformationLength, OUT PULONG ReturnLength OPTIONAL);
 
-static NTSTATUS NtQueryInformationProcessHook(IN HANDLE ProcessHandle, IN PROCESSINFOCLASS ProcessInformationClass, OUT PVOID ProcessInformation, IN ULONG ProcessInformationLength, OUT PULONG ReturnLength OPTIONAL)
+NTSTATUS NtQueryInformationProcessHook(IN HANDLE ProcessHandle, IN PROCESSINFOCLASS ProcessInformationClass, OUT PVOID ProcessInformation, IN ULONG ProcessInformationLength, OUT PULONG ReturnLength OPTIONAL)
 {
 	NTSTATUS status = ((NtQueryInformationProcessType)origQIP)(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength, ReturnLength);
 
@@ -135,10 +135,18 @@ NTSTATUS NTAPI NtCloseHook(IN HANDLE Handle)
 
 	if (NtQueryObject(Handle, (OBJECT_INFORMATION_CLASS)4, &info, sizeof(OBJECT_HANDLE_ATTRIBUTE_INFORMATION), nullptr) >= 0)
 	{
-		return origClose(Handle);
+		DWORD flags = 0;
+
+		if (GetHandleInformation(Handle, &flags) && (flags & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0)
+		{
+			return STATUS_SUCCESS;
+		}
+
+		origClose(Handle);
+		return STATUS_SUCCESS;
 	}
-	
-	return STATUS_INVALID_HANDLE;
+
+	return STATUS_SUCCESS;
 }
 
 
@@ -149,10 +157,12 @@ void LSP_InitializeHooks()
 
 	MH_CreateHookApi(L"kernelbase.dll", "RegOpenKeyExA", ProcessLSPRegOpenKeyExA, (void**)&g_origRegOpenKeyExA);
 
-	if (CoreIsDebuggerPresent())
+	//if (CoreIsDebuggerPresent())
 	{
-		MH_CreateHookApi(L"ntdll.dll", "NtQueryInformationProcess", NtQueryInformationProcessHook, (void**)&origQIP);
-		MH_CreateHookApi(L"ntdll.dll", "NtClose", NtCloseHook, (void**)&origClose);
+		//MH_CreateHookApi(L"ntdll.dll", "NtQueryInformationProcess", NtQueryInformationProcessHook, (void**)&origQIP);
+		//MH_CreateHookApi(L"ntdll.dll", "NtClose", NtCloseHook, (void**)&origClose);
+		origQIP = (decltype(origQIP))GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtQueryInformationProcess");
+		origClose = (decltype(origClose))GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtClose");
 	}
 
 	MH_EnableHook(MH_ALL_HOOKS);

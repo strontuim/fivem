@@ -4,9 +4,17 @@ namespace CitizenFX.Core
 {
 	interface InternalManagerInterface
 	{
+		void SetResourceName(string resourceName);
+
+		void CreateTaskScheduler();
+
+		void Destroy();
+
 		void SetScriptHost(IScriptHost host, int instanceId);
 
-		void CreateAssembly(byte[] assemblyData, byte[] symbolData);
+		void CreateAssembly(string name, byte[] assemblyData, byte[] symbolData);
+
+		void LoadAssembly(string name);
 
 		void Tick();
 
@@ -19,5 +27,7 @@ namespace CitizenFX.Core
 		void RemoveRef(int refIndex);
 
 		ulong GetMemoryUsage();
+
+		byte[] WalkStack(byte[] boundaryStart, byte[] boundaryEnd);
 	}
 }

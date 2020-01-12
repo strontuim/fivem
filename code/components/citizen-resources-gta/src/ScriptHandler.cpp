@@ -10,19 +10,26 @@
 #include <ResourceManager.h>
 #include <scrEngine.h>
 
-#include <GameInit.h>
+#include <ICoreGameInit.h>
 
-#include <Brofiler.h>
+#if __has_include(<GameInit.h>)
+#include <GameInit.h>
+#endif
+
+#include <optick.h>
 
 extern fwRefContainer<fx::ResourceManager> g_resourceManager;
+
+bool DLL_IMPORT UpdateScriptInitialization();
 
 class TestScriptThread : public GtaThread
 {
 	virtual void DoRun() override
 	{
-		PROFILE;
+		OPTICK_EVENT();
 
 		static bool initedGame = false;
+		static int tickCount = 0;
 
 		if (!initedGame)
 		{
@@ -31,15 +38,37 @@ class TestScriptThread : public GtaThread
 			return;
 		}
 
+		if (Instance<ICoreGameInit>::Get()->HasVariable("networkTimedOut"))
+		{
+			return;
+		}
+
+		if (!UpdateScriptInitialization())
+		{
+			return;
+		}
+
 		static std::once_flag of;
 
 		std::call_once(of, []()
 		{
-			OnKillNetworkDone.Connect([]()
+#if __has_include(<GameInit.h>)
+			OnKillNetwork.Connect([](const char*)
 			{
+				Instance<ICoreGameInit>::Get()->ClearVariable("gameSettled");
+
+				tickCount = 0;
 				initedGame = false;
 			});
+#endif
 		});
+
+		tickCount++;
+
+		if (tickCount == 10)
+		{
+			Instance<ICoreGameInit>::Get()->SetVariable("gameSettled");
+		}
 
 		g_resourceManager->Tick();
 	}
@@ -48,7 +77,7 @@ class TestScriptThread : public GtaThread
 TestScriptThread thread;
 extern GtaThread* g_resourceThread;
 
-#ifdef USE_PROFILER
+#if USE_OPTICK
 class ProfilerEventHolder : public fwRefCountable
 {
 public:
@@ -64,10 +93,10 @@ private:
 	{
 		if (!m_desc)
 		{
-			m_desc = Profiler::EventDescription::Create(va("Resource::Tick %s", resource->GetName()), __FILE__, __LINE__, Profiler::Color::GreenYellow);
+			m_desc = Optick::EventDescription::Create(va("Resource::Tick %s", resource->GetName()), __FILE__, __LINE__, Optick::Color::GreenYellow);
 		}
 
-		m_event = std::make_unique<Profiler::Event>(*m_desc);
+		m_event = std::make_unique<Optick::Event>(*m_desc);
 	}
 
 	void EndTick()
@@ -76,13 +105,15 @@ private:
 	}
 
 private:
-	Profiler::EventDescription* m_desc;
+	Optick::EventDescription* m_desc;
 
-	std::unique_ptr<Profiler::Event> m_event;
+	std::unique_ptr<Optick::Event> m_event;
 };
 
 DECLARE_INSTANCE_TYPE(ProfilerEventHolder);
 #endif
+
+#include <stack>
 
 static InitFunction initFunction([] ()
 {
@@ -92,7 +123,26 @@ static InitFunction initFunction([] ()
 		g_resourceThread = &thread;
 	});
 
-#ifdef USE_PROFILER
+#ifdef IS_RDR3
+	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
+	{
+		static thread_local std::stack<rage::scrThread*> lastActiveThread;
+
+		resource->OnActivate.Connect([]()
+		{
+			lastActiveThread.push(rage::scrEngine::GetActiveThread());
+			rage::scrEngine::SetActiveThread(g_resourceThread);
+		}, -999);
+
+		resource->OnDeactivate.Connect([]()
+		{
+			rage::scrEngine::SetActiveThread(lastActiveThread.top());
+			lastActiveThread.pop();
+		}, 999);
+	});
+#endif
+
+#if USE_OPTICK
 	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
 	{
 		resource->SetComponent(new ProfilerEventHolder(resource));

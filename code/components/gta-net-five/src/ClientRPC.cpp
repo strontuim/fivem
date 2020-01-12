@@ -17,9 +17,9 @@
 
 #include <Hooking.h>
 
-static inline int GetServerId(const ScPlayerData* platformData)
+static inline int GetServerId(const rlGamerInfo* platformData)
 {
-	return (platformData->addr.ipLan & 0xFFFF) ^ 0xFEED;
+	return (platformData->peerAddress.localAddr.ip.addr & 0xFFFF) ^ 0xFEED;
 }
 
 extern NetLibrary* g_netLibrary;
@@ -29,6 +29,26 @@ extern NetLibrary* g_netLibrary;
 #include <concurrent_queue.h>
 
 static std::shared_ptr<RpcConfiguration> g_rpcConfiguration;
+
+struct ResourceActivationScope
+{
+	ResourceActivationScope(fx::Resource* resource)
+	{
+		resource->OnActivate();
+
+		m_resource = resource;
+	}
+
+	~ResourceActivationScope()
+	{
+		m_resource->OnDeactivate();
+
+		m_resource = nullptr;
+	}
+
+private:
+	fx::Resource* m_resource;
+};
 
 class RpcNextTickQueue : public fwRefCountable, public fx::IAttached<fx::Resource>
 {
@@ -49,6 +69,8 @@ public:
 
 			while (m_queue.try_pop(entry))
 			{
+				ResourceActivationScope activationScope(resource);
+
 				if (entry.cond && !entry.cond())
 				{
 					pushQueue.push(std::move(entry));
@@ -60,6 +82,8 @@ public:
 
 			while (!pushQueue.empty())
 			{
+				ResourceActivationScope activationScope(resource);
+
 				auto& entry = pushQueue.front();
 				m_queue.push(std::move(entry));
 

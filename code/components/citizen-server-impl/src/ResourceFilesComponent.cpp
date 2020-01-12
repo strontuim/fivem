@@ -468,38 +468,48 @@ namespace fx
 			
 			auto metaData = m_resource->GetComponent<fx::ResourceMetaDataComponent>();
 
-			fileEntries.emplace_back("__resource.lua");
+			// add the metadata definition file
+			auto isCfxV2 = metaData->GetEntries("is_cfxv2");
+
+			if (isCfxV2.begin() == isCfxV2.end())
+			{
+				fileEntries.emplace_back("__resource.lua");
+			}
+			else
+			{
+				fileEntries.emplace_back("fxmanifest.lua");
+			}
 
 			// add files
-			auto files = metaData->GetEntries("file");
+			auto files = metaData->GlobEntriesVector("file");
 
 			for (auto& file : files)
 			{
-				fileEntries.emplace_back(file.second);
+				fileEntries.emplace_back(file);
 			}
 
 			// add client scripts
-			files = metaData->GetEntries("client_script");
+			files = metaData->GlobEntriesVector("client_script");
 
 			for (auto& file : files)
 			{
-				fileEntries.emplace_back(file.second);
+				fileEntries.emplace_back(file);
 			}
 
 			// add shared scripts
-			files = metaData->GetEntries("shared_script");
+			files = metaData->GlobEntriesVector("shared_script");
 
 			for (auto& file : files)
 			{
-				fileEntries.emplace_back(file.second);
+				fileEntries.emplace_back(file);
 			}
 
 			// TEMP DBG: add `map`
-			files = metaData->GetEntries("map");
+			files = metaData->GlobEntriesVector("map");
 
 			for (auto& file : files)
 			{
-				fileEntries.emplace_back(file.second);
+				fileEntries.emplace_back(file);
 			}
 
 			return fileEntries;

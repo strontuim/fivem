@@ -23,7 +23,7 @@
 extern "C" BOOL WINAPI _CRT_INIT(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 
 void InitializeDummies();
-void EnsureGamePath();
+std::optional<int> EnsureGamePath();
 
 bool InitializeExceptionHandler();
 
@@ -38,9 +38,52 @@ extern "C" int wmainCRTStartup();
 void DoPreLaunchTasks();
 void NVSP_DisableOnStartup();
 bool ExecutablePreload_Init();
+void InitLogging();
+
+#include <MinMode.h>
+#include <fstream>
+
+std::shared_ptr<fx::MinModeManifest> InitMinMode()
+{
+	const wchar_t* cli = GetCommandLineW();
+
+	auto minmodePos = wcsstr(cli, L"+set minmodemanifest \"");
+
+	try
+	{
+		if (minmodePos != nullptr)
+		{
+			std::wstring fileName = &minmodePos[wcslen(L"+set minmodemanifest \"")];
+			auto fnEnd = fileName.find_first_of('"');
+
+			if (fnEnd != std::string::npos)
+			{
+				fileName = fileName.substr(0, fnEnd);
+
+				std::ifstream fs(fileName);
+
+				nlohmann::json j;
+				fs >> j;
+
+				return std::make_shared<fx::MinModeManifest>(j);
+			}
+		}
+	}
+	catch (std::exception& e)
+	{
+
+	}
+
+	return std::make_shared<fx::MinModeManifest>();
+}
+
+HANDLE g_uiDoneEvent;
+HANDLE g_uiExitEvent;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
+	//SetEnvironmentVariableW(L"CitizenFX_ToolMode", L"1");
+
 	bool toolMode = false;
 
 	if (getenv("CitizenFX_ToolMode"))
@@ -57,12 +100,43 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
+#if 0
+	// TEST
+	auto tenner = UI_InitTen();
+
+	UI_DoCreation();
+
+	while (!UI_IsCanceled())
+	{
+		HANDLE h = GetCurrentThread();
+		MsgWaitForMultipleObjects(1, &h, FALSE, 50, QS_ALLEVENTS);
+		
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+		{
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+
+		UI_UpdateText(0, va(L"%d", GetTickCount()));
+		UI_UpdateText(1, va(L"%x", GetTickCount()));
+
+		UI_UpdateProgress(50.0);
+	}
+
+	UI_DoDestruction();
+
+	tenner = {};
+
+	ExitProcess(0);
+#endif
+
 	// delete any old .exe.new file
 	_unlink("CitizenFX.exe.new");
 
 	// path environment appending of our primary directories
 	static wchar_t pathBuf[32768];
-	GetEnvironmentVariable(L"PATH", pathBuf, sizeof(pathBuf));
+	GetEnvironmentVariable(L"PATH", pathBuf, std::size(pathBuf));
 
 	std::wstring newPath = MakeRelativeCitPath(L"bin") + L";" + MakeRelativeCitPath(L"") + L";" + std::wstring(pathBuf);
 
@@ -113,17 +187,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		return 0;
 	}
 
-	SetCurrentProcessExplicitAppUserModelID(L"CitizenFX.FiveM.Client");
+	// store the last run directory for assistance purposes
+	{
+		auto regPath = MakeRelativeCitPath(L"");
+
+		RegSetKeyValueW(HKEY_CURRENT_USER, L"SOFTWARE\\CitizenFX\\" PRODUCT_NAME, L"Last Run Location", REG_SZ, regPath.c_str(), (regPath.size() + 1) * 2);
+	}
+
+	SetCurrentProcessExplicitAppUserModelID(L"CitizenFX." PRODUCT_NAME L".Client");
 
 	static HostSharedData<CfxState> initState("CfxInitState");
 
+#ifdef IS_LAUNCHER
+	initState->isReverseGame = true;
+#endif
+
 	// check if the master process still lives
 	{
-		HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, initState->initialPid);
+		HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, initState->GetInitialPid());
 
 		if (hProcess == nullptr)
 		{
-			initState->initialPid = GetCurrentProcessId();
+			initState->SetInitialPid(GetCurrentProcessId());
 		}
 		else
 		{
@@ -132,7 +217,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 			if (exitCode != STILL_ACTIVE)
 			{
-				initState->initialPid = GetCurrentProcessId();
+				initState->SetInitialPid(GetCurrentProcessId());
 			}
 
 			CloseHandle(hProcess);
@@ -143,6 +228,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	if (!devMode)
 	{
 		devMode = !initState->IsMasterProcess();
+	}
+
+	// init tenUI
+	std::unique_ptr<TenUIBase> tui;
+
+	if (initState->IsMasterProcess())
+	{
+		tui = UI_InitTen();
 	}
 
 	if (!devMode)
@@ -158,12 +251,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		return 0;
 	}
 
-	// load global dinput8.dll over any that might exist in the game directory
+	InitLogging();
+
+	// load some popular DLLs over the system-wide variants
+	auto systemDlls = {
+		// common ASI loaders
+		L"\\dinput8.dll",
+		L"\\dsound.dll", // breaks DSound init in game code
+
+		// packed DLL commonly shipping with RDR mods
+		L"\\version.dll"
+	};
+
+	for (auto dll : systemDlls)
 	{
 		wchar_t systemPath[512];
 		GetSystemDirectory(systemPath, _countof(systemPath));
 
-		wcscat_s(systemPath, L"\\dinput8.dll");
+		wcscat_s(systemPath, dll);
 
 		LoadLibrary(systemPath);
 	}
@@ -244,7 +349,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	}
 
 	// make sure the game path exists
-	EnsureGamePath();
+	if (auto gamePathExit = EnsureGamePath(); gamePathExit)
+	{
+		return *gamePathExit;
+	}
 
 	if (addDllDirectory)
 	{
@@ -295,8 +403,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 				if (showOSWarning)
 				{
-					MessageBox(nullptr, L"You are currently using an outdated version of Windows. This may lead to issues using the FiveM client. Please update to Windows 10 version 1703 (\"Creators Update\") or higher in case you are experiencing "
-						L"any issues. The game will continue to start now.", L"FiveM", MB_OK | MB_ICONWARNING);
+					MessageBox(nullptr, L"You are currently using an outdated version of Windows. This may lead to issues using the " PRODUCT_NAME L" client. Please update to Windows 10 version 1703 (\"Creators Update\") or higher in case you are experiencing "
+						L"any issues. The game will continue to start now.", PRODUCT_NAME, MB_OK | MB_ICONWARNING);
 				}
 			}
 
@@ -342,7 +450,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				{
 					if (GetLastError() == ERROR_ACCESS_DENIED)
 					{
-						MessageBox(nullptr, L"FiveM could not create a file in the folder it is placed in. Please move your installation out of Program Files or another protected folder.", L"Error", MB_OK | MB_ICONSTOP);
+						MessageBox(nullptr, PRODUCT_NAME L" could not create a file in the folder it is placed in. Please move your installation out of Program Files or another protected folder.", L"Error", MB_OK | MB_ICONSTOP);
 						return 0;
 					}
 				}
@@ -354,7 +462,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
-	NVSP_DisableOnStartup();
+	if (initState->IsMasterProcess())
+	{
+		NVSP_DisableOnStartup();
+	}
 
 	// readd the game path into the PATH
 	newPath = MakeRelativeCitPath(L"bin\\crt") + L";" + MakeRelativeCitPath(L"bin") + L";" + MakeRelativeCitPath(L"") + L";" + MakeRelativeGamePath(L"") + L"; " + std::wstring(pathBuf);
@@ -374,13 +485,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	// check stuff regarding the game executable
 	std::wstring gameExecutable = MakeRelativeGamePath(GAME_EXECUTABLE);
 
+#ifndef IS_LAUNCHER
 	if (GetFileAttributes(gameExecutable.c_str()) == INVALID_FILE_ATTRIBUTES)
 	{
 		MessageBox(nullptr, L"Could not find the game executable (" GAME_EXECUTABLE L") at the configured path. Please check your CitizenFX.ini file.", PRODUCT_NAME, MB_OK | MB_ICONERROR);
 		return 0;
 	}
+#endif
 
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 	if (!ExecutablePreload_Init())
 	{
 		return 0;
@@ -389,8 +502,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	// ensure game cache is up-to-date, and obtain redirection metadata from the game cache
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 	auto redirectionData = UpdateGameCache();
+
+	if (redirectionData.empty())
+	{
+		return 0;
+	}
+
 	g_redirectionData = redirectionData;
 
+#ifdef GTA_FIVE
 	gameExecutable = converter.from_bytes(redirectionData["GTA5.exe"]);
 
 	{
@@ -424,11 +544,113 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 #endif
+#endif
+
+	tui = {};
+
+	auto minModeManifest = InitMinMode();
+
+	g_uiExitEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIExit");
+	g_uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIDone");
+
+	if (initState->IsMasterProcess() && !toolMode)
+	{
+		std::thread([/*tui = std::move(tui)*/minModeManifest]() mutable
+		{
+			static HostSharedData<CfxState> initState("CfxInitState");
+
+//#ifndef _DEBUG
+			if (!initState->isReverseGame)
+			{
+				//auto tuiTen = std::move(tui);
+				auto tuiTen = UI_InitTen();
+
+				// say hi
+				UI_DoCreation(false);
+
+				auto st = GetTickCount64();
+				UI_UpdateText(0, va(L"Starting %s...", 
+					ToWide(minModeManifest->Get("productName", ToNarrow(PRODUCT_NAME)))));
+
+				UI_UpdateText(1, ToWide(minModeManifest->Get("productSubtitle", "We're getting there.")).c_str());
+
+				while (GetTickCount64() < (st + 3500))
+				{
+					HANDLE hs[] =
+					{
+						g_uiExitEvent
+					};
+
+					auto res = MsgWaitForMultipleObjects(std::size(hs), hs, FALSE, 50, QS_ALLEVENTS);
+
+					if (res == WAIT_OBJECT_0)
+					{
+						break;
+					}
+
+					MSG msg;
+					while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+					{
+						TranslateMessage(&msg);
+						DispatchMessage(&msg);
+					}
+
+					UI_UpdateProgress((GetTickCount64() - st) / 35.0);
+				}
+
+				UI_DoDestruction();
+			}
+//#endif
+
+			SetEvent(g_uiDoneEvent);
+		}).detach();
+	}
 
 	if (!toolMode)
 	{
-		// game launcher initialization
-		CitizenGame::Launch(gameExecutable, true);
+		CitizenGame::SetMinModeManifest(minModeManifest->GetRaw());
+
+		wchar_t fxApplicationName[MAX_PATH];
+		GetModuleFileName(GetModuleHandle(nullptr), fxApplicationName, _countof(fxApplicationName));
+
+#ifdef IS_LAUNCHER
+		// is this the game runtime subprocess?
+		if (wcsstr(fxApplicationName, L"GameRuntime") != nullptr)
+		{
+#else
+		if (initState->IsMasterProcess())
+		{
+#endif
+#ifdef _DEBUG
+			//MessageBox(nullptr, va(L"Gameruntime starting (pid %d)", GetCurrentProcessId()), L"CitizenFx", MB_OK);
+#endif
+
+			// game launcher initialization
+			CitizenGame::Launch(gameExecutable);
+		}
+#ifdef IS_LAUNCHER
+		// it's not, is this the first process running?
+		else if (initState->IsMasterProcess())
+		{
+			// run game mode
+			HMODULE coreRT = LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str());
+
+			if (coreRT)
+			{
+				auto gameProc = (void(*)())GetProcAddress(coreRT, "GameMode_Init");
+
+				if (gameProc)
+				{
+					gameProc();
+				}
+			}
+		}
+#endif
+		else
+		{
+			// could be it's a prelauncher like Chrome
+			CitizenGame::Launch(gameExecutable, true);
+		}
 	}
 	else
 	{

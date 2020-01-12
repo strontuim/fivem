@@ -8,27 +8,46 @@
 #include <ServerInstanceBase.h>
 #include <ComponentHolder.h>
 
+#ifdef COMPILING_CITIZEN_SERVER_NET
+#define CSNET_EXPORT DLL_EXPORT
+#else
+#define CSNET_EXPORT DLL_IMPORT
+#endif
+
 namespace fx
 {
-	class TcpListenManager : public fwRefCountable, public IAttached<ServerInstanceBase>
+	class CSNET_EXPORT TcpListenManager : public fwRefCountable, public IAttached<ServerInstanceBase>
 	{
 	private:
 		fwRefContainer<net::TcpServerManager> m_tcpStack;
 
 		std::vector<fwRefContainer<net::MultiplexTcpServer>> m_multiplexServers;
 
+		std::vector<fwRefContainer<net::TcpServer>> m_externalServers;
+
 		std::shared_ptr<ConsoleCommand> m_addEndpointCommand;
 
-	public:
-		TcpListenManager();
+		std::shared_ptr<ConVar<int>> m_primaryPortVar;
 
-		void Initialize();
+		int m_primaryPort;
+
+	public:
+		TcpListenManager(const std::string& loopName = "default");
+
+		void Initialize(const std::string& loopName = "default");
 
 		void AddEndpoint(const std::string& endPoint);
+
+		virtual void AddExternalServer(const fwRefContainer<net::TcpServer>& server);
 
 		inline fwRefContainer<net::TcpServerManager> GetTcpStack()
 		{
 			return m_tcpStack;
+		}
+
+		inline int GetPrimaryPort()
+		{
+			return m_primaryPort;
 		}
 
 		virtual void AttachToObject(ServerInstanceBase* instance) override;

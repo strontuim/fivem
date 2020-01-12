@@ -31,12 +31,17 @@ private:
 	fwRefContainer<UvLoopHolder> m_uvLoop;
 
 public:
-	TcpServerManager();
+	TcpServerManager(const std::string& loopName = std::string("default"));
 
 	virtual ~TcpServerManager();
 
 public:
 	virtual fwRefContainer<TcpServer> CreateServer(const PeerAddress& bindAddress) override;
+
+	inline std::shared_ptr<uvw::Loop> GetWrapLoop()
+	{
+		return m_uvLoop->Get();
+	}
 
 	inline uv_loop_t* GetLoop()
 	{

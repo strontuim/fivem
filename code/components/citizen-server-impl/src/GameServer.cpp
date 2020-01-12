@@ -17,12 +17,31 @@
 
 #include <msgpack.hpp>
 
-#include <protocol/reqrep0/req.h>
-#include <protocol/reqrep0/rep.h>
+#include <UvLoopManager.h>
+#include <UvTcpServer.h> // for UvCallback
+
+#include <MonoThreadAttachment.h>
+
+#include <HttpClient.h>
+#include <TcpListenManager.h>
+#include <ServerLicensingComponent.h>
+
+#include <json.hpp>
+
+#include <nng/protocol/reqrep0/req.h>
+#include <nng/protocol/reqrep0/rep.h>
+
+#include <KeyedRateLimiter.h>
+
+#ifdef _WIN32
+#include <ResumeComponent.h>
+#endif
 
 static fx::GameServer* g_gameServer;
 
 extern std::shared_ptr<ConVar<bool>> g_oneSyncVar;
+
+extern fwEvent<> OnEnetReceive;
 
 namespace fx
 {
@@ -50,6 +69,25 @@ namespace fx
 	{
 		m_instance = instance;
 
+		m_gamename = instance->AddVariable<GameName>("gamename", ConVar_ServerInfo, GameName::GTA5);
+		m_lastGameName = m_gamename->GetHelper()->GetValue();
+
+#ifdef _WIN32
+		OnAbnormalTermination.Connect([this](void* reason)
+		{
+			auto realReason = fmt::sprintf("Server shutting down: %s", (const char*)reason);
+
+			m_clientRegistry->ForAllClients([this, realReason](const std::shared_ptr<fx::Client>& client)
+			{
+				if (client->GetPeer())
+				{
+					auto oob = fmt::sprintf("error %s", realReason);
+					m_net->SendOutOfBand(client->GetAddress(), oob);
+				}
+			});
+		});
+#endif
+
 		m_net = fx::CreateGSNet(this);
 
 		if (m_interceptor)
@@ -61,23 +99,122 @@ namespace fx
 
 		m_rconPassword = instance->AddVariable<std::string>("rcon_password", ConVar_None, "");
 		m_hostname = instance->AddVariable<std::string>("sv_hostname", ConVar_ServerInfo, "default FXServer");
-		m_masters[0] = instance->AddVariable<std::string>("sv_master1", ConVar_None, "live-internal.fivem.net:30110");
+		m_masters[0] = instance->AddVariable<std::string>("sv_master1", ConVar_None, "https://servers-ingress-live.fivem.net/ingress");
 		m_masters[1] = instance->AddVariable<std::string>("sv_master2", ConVar_None, "");
 		m_masters[2] = instance->AddVariable<std::string>("sv_master3", ConVar_None, "");
+		m_listingIpOverride = instance->AddVariable<std::string>("sv_listingIpOverride", ConVar_None, "");
+		m_useDirectListing = instance->AddVariable<bool>("sv_useDirectListing", ConVar_None, false);
 
 		m_heartbeatCommand = instance->AddCommand("heartbeat", [=]()
 		{
 			ForceHeartbeat();
 		});
 
+		m_mainThreadCallbacks = std::make_unique<CallbackListNng>("inproc://main_client", 0);
+
+		instance->OnRequestQuit.Connect([this](const std::string& reason)
+		{
+			m_clientRegistry->ForAllClients([this, &reason](const std::shared_ptr<fx::Client>& client)
+			{
+				DropClient(client, "Server shutting down: %s", reason);
+			});
+		});
+
 		instance->OnInitialConfiguration.Connect([=]()
 		{
-			m_thread = std::thread([=]()
+			if (!m_net->SupportsUvUdp())
 			{
-				SetThreadName(-1, "[Cfx] Server Thread");
+				m_thread = std::thread([=]()
+				{
+					SetThreadName(-1, "[Cfx] Server Thread");
 
-				Run();
-			});
+					m_mainThreadCallbacks->AttachToThread();
+
+					Run();
+				});
+			}
+			else
+			{
+				m_mainThreadLoop = Instance<net::UvLoopManager>::Get()->GetOrCreate("svMain");
+
+				static std::shared_ptr<uvw::SignalHandle> sigint = m_mainThreadLoop->Get()->resource<uvw::SignalHandle>();
+				sigint->start(SIGINT);
+
+				static std::shared_ptr<uvw::SignalHandle> sighup = m_mainThreadLoop->Get()->resource<uvw::SignalHandle>();
+				sighup->start(SIGHUP);
+
+				sigint->on<uvw::SignalEvent>([this](const uvw::SignalEvent& ev, uvw::SignalHandle& sig)
+				{
+					se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
+					m_instance->GetComponent<console::Context>()->ExecuteSingleCommandDirect(ProgramArguments{ "quit", "SIGINT received" });
+				});
+
+				sighup->on<uvw::SignalEvent>([this](const uvw::SignalEvent& ev, uvw::SignalHandle& sig)
+				{
+					se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
+					m_instance->GetComponent<console::Context>()->ExecuteSingleCommandDirect(ProgramArguments{ "quit", "SIGHUP received" });
+				});
+
+				auto asyncInitHandle = std::make_shared<std::unique_ptr<UvHandleContainer<uv_async_t>>>();;
+				*asyncInitHandle = std::make_unique<UvHandleContainer<uv_async_t>>();
+
+				uv_async_init(m_mainThreadLoop->GetLoop(), (*asyncInitHandle)->get(), UvPersistentCallback((*asyncInitHandle)->get(), [this, asyncInitHandle](uv_async_t*)
+				{
+					// private data for the net thread
+					struct MainPersistentData
+					{
+						UvHandleContainer<uv_timer_t> tickTimer;
+
+						std::shared_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> callbackAsync;
+
+						std::chrono::milliseconds lastTime;
+					};
+
+					auto mainData = std::make_shared<MainPersistentData>();
+					mainData->lastTime = msec();
+
+					auto loop = m_mainThreadLoop->GetLoop();
+
+					// periodic timer for network ticks
+					auto frameTime = 1000 / 20;
+
+					auto mpd = mainData.get();
+
+					uv_timer_init(loop, &mainData->tickTimer);
+					uv_timer_start(&mainData->tickTimer, UvPersistentCallback(&mainData->tickTimer, [this, mpd](uv_timer_t*)
+					{
+						auto now = msec();
+						auto thisTime = now - mpd->lastTime;
+						mpd->lastTime = now;
+
+						if (thisTime > 150ms)
+						{
+							trace("server thread hitch warning: timer interval of %d milliseconds\n", thisTime.count());
+						}
+
+						ProcessServerFrame(thisTime.count());
+					}), frameTime, frameTime);
+
+					// event handle for callback list evaluation
+					
+					// unique_ptr wrapper is a workaround for libc++ bug (fixed in LLVM r340823)
+					mainData->callbackAsync = std::make_shared<std::unique_ptr<UvHandleContainer<uv_async_t>>>();
+					*mainData->callbackAsync = std::make_unique<UvHandleContainer<uv_async_t>>();
+
+					uv_async_init(loop, (*mainData->callbackAsync)->get(), UvPersistentCallback((*mainData->callbackAsync)->get(), [this](uv_async_t*)
+					{
+						m_mainThreadCallbacks->Run();
+					}));
+
+					m_mainThreadCallbacks = std::make_unique<CallbackListUv>(mainData->callbackAsync);
+					m_mainThreadCallbacks->AttachToThread();
+
+					// store the pointer in the class for lifetime purposes
+					m_mainThreadData = std::move(mainData);
+				}));
+
+				uv_async_send((*asyncInitHandle)->get());
+			}
 		}, 100);
 
 		m_clientRegistry = instance->GetComponent<ClientRegistry>().GetRef();
@@ -91,7 +228,7 @@ namespace fx
 					// if the master is set
 					std::string masterName = master->GetValue();
 
-					if (!masterName.empty())
+					if (!masterName.empty() && masterName.find("https://") != 0 && masterName.find("http://") != 0)
 					{
 						// look up if not cached
 						auto address = net::PeerAddress::FromString(masterName, 30110, net::PeerAddress::LookupType::ResolveName);
@@ -112,9 +249,98 @@ namespace fx
 			}
 		}).detach();
 
+		if (m_net->SupportsUvUdp())
+		{
+			InitializeNetUv();
+		}
+		else
+		{
+			InitializeNetThread();
+		}
+	}
+
+	void GameServer::InitializeNetUv()
+	{
+		m_netThreadLoop = Instance<net::UvLoopManager>::Get()->GetOrCreate("svNetwork");
+
+		auto asyncInitHandle = std::make_shared<std::unique_ptr<UvHandleContainer<uv_async_t>>>();
+		*asyncInitHandle = std::make_unique<UvHandleContainer<uv_async_t>>();
+
+		uv_async_init(m_netThreadLoop->GetLoop(), (*asyncInitHandle)->get(), UvPersistentCallback((*asyncInitHandle)->get(), [this, asyncInitHandle](uv_async_t*)
+		{
+			// private data for the net thread
+			struct NetPersistentData
+			{
+				UvHandleContainer<uv_timer_t> tickTimer;
+
+				std::shared_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> callbackAsync;
+
+				std::chrono::milliseconds lastTime;
+			};
+
+			auto netData = std::make_shared<NetPersistentData>();
+			auto loop = m_netThreadLoop->GetLoop();
+
+			netData->lastTime = msec();
+
+			// periodic timer for network ticks
+			auto frameTime = 1000 / 120;
+
+			auto mpd = netData.get();
+			
+			uv_timer_init(loop, &netData->tickTimer);
+			uv_timer_start(&netData->tickTimer, UvPersistentCallback(&netData->tickTimer, [this, mpd](uv_timer_t*)
+			{
+				auto now = msec();
+				auto thisTime = now - mpd->lastTime;
+				mpd->lastTime = now;
+
+				if (thisTime > 150ms)
+				{
+					trace("network thread hitch warning: timer interval of %d milliseconds\n", thisTime.count());
+				}
+
+				m_net->Process();
+				OnNetworkTick();
+			}), frameTime, frameTime);
+
+			// event handle for callback list evaluation
+
+			// unique_ptr wrapper is a workaround for libc++ bug (fixed in LLVM r340823)
+			netData->callbackAsync = std::make_shared<std::unique_ptr<UvHandleContainer<uv_async_t>>>();
+			*netData->callbackAsync = std::make_unique<UvHandleContainer<uv_async_t>>();
+
+			uv_async_init(loop, (*netData->callbackAsync)->get(), UvPersistentCallback((*netData->callbackAsync)->get(), [this](uv_async_t*)
+			{
+				m_netThreadCallbacks->Run();
+			}));
+
+			m_netThreadCallbacks = std::make_unique<CallbackListUv>(netData->callbackAsync);
+			m_netThreadCallbacks->AttachToThread();
+
+			// process hosts on a command
+			// #TODO1SBIG: add bigmode check/convar?
+			/*OnEnetReceive.Connect([this]()
+			{
+				m_net->Process();
+			});*/
+
+			// store the pointer in the class for lifetime purposes
+			m_netThreadData = std::move(netData);
+		}));
+
+		uv_async_send((*asyncInitHandle)->get());
+	}
+
+	void GameServer::InitializeNetThread()
+	{
+		m_netThreadCallbacks = std::make_unique<CallbackListNng>("inproc://netlib_client", 1);
+
 		std::thread([this]()
 		{
 			SetThreadName(-1, "[Cfx] Network Thread");
+
+			m_netThreadCallbacks->AttachToThread();
 
 			nng_socket netSocket;
 			nng_rep0_open(&netSocket);
@@ -170,7 +396,7 @@ namespace fx
 				{
 					void* msgBuffer;
 					size_t msgLen;
-					
+
 					while (nng_recv(netSocket, &msgBuffer, &msgLen, NNG_FLAG_NONBLOCK | NNG_FLAG_ALLOC) == 0)
 					{
 						nng_free(msgBuffer, msgLen);
@@ -178,7 +404,7 @@ namespace fx
 						int ok = 0;
 						nng_send(netSocket, &ok, 4, NNG_FLAG_NONBLOCK);
 
-						m_netThreadCallbacks.Run();
+						m_netThreadCallbacks->Run();
 					}
 				}
 			}
@@ -197,7 +423,7 @@ namespace fx
 			int ok = 0;
 			nng_send(socket, &ok, 4, NNG_FLAG_NONBLOCK);
 
-			m_mainThreadCallbacks.Run();
+			m_mainThreadCallbacks->Run();
 		}
 	}
 
@@ -211,8 +437,19 @@ namespace fx
 		m_net->ResetPeer(peerId);
 	}
 
-	void GameServer::InternalSendPacket(int peer, int channel, const net::Buffer& buffer, NetPacketType type)
+	void GameServer::InternalSendPacket(const std::shared_ptr<fx::Client>& client, int peer, int channel, const net::Buffer& buffer, NetPacketType type)
 	{
+		// TODO: think of a more uniform way to determine null peers
+		if (m_net->GetPeer(peer)->GetPing() == -1)
+		{
+			if (type == NetPacketType_ReliableReplayed)
+			{
+				client->PushReplayPacket(channel, buffer);
+			}
+
+			return;
+		}
+
 		m_net->SendPacket(peer, channel, buffer, type);
 	}
 
@@ -310,9 +547,13 @@ namespace fx
 						}
 					}
 
+					bool wasNew = false;
+
 					if (client->GetNetId() >= 0xFFFF)
 					{
 						m_clientRegistry->HandleConnectingClient(client);
+
+						wasNew = true;
 					}
 
 					peer->OnSendConnectOK();
@@ -328,24 +569,33 @@ namespace fx
 						client->GetNetId(),
 						(host) ? host->GetNetId() : -1,
 						(host) ? host->GetNetBase() : -1,
-						(g_oneSyncVar->GetValue()) ? client->GetSlotId() : -1,
+						(g_oneSyncVar->GetValue())
+							? ((fx::IsBigMode())
+								? 128
+								: client->GetSlotId())
+							: -1,
 						(g_oneSyncVar->GetValue()) ? msec().count() : -1);
 
 					outMsg.Write(outStr.c_str(), outStr.size());
 
 					client->SendPacket(0, outMsg, NetPacketType_Reliable);
 
-					gscomms_execute_callback_on_main_thread([=]()
-					{
-						m_clientRegistry->HandleConnectedClient(client);
-					});
+					client->ReplayPackets();
 
-					if (g_oneSyncVar->GetValue())
+					if (wasNew)
 					{
-						m_instance->GetComponent<fx::ServerGameState>()->SendObjectIds(client, 64);
+						gscomms_execute_callback_on_main_thread([=]()
+						{
+							m_clientRegistry->HandleConnectedClient(client);
+						});
+
+						if (g_oneSyncVar->GetValue())
+						{
+							m_instance->GetComponent<fx::ServerGameState>()->SendObjectIds(client, fx::IsBigMode() ? 4 : 64);
+						}
+
+						ForceHeartbeat();
 					}
-
-					ForceHeartbeat();
 				}
 			}
 
@@ -393,18 +643,40 @@ namespace fx
 		m_deferCallbacks.insert({ cbIdx.fetch_add(1), { m_serverTime + inMsec, fn } });
 	}
 
-	void GameServer::CallbackList::Add(const std::function<void()>& fn)
+	void GameServer::CallbackListBase::Add(const std::function<void()>& fn, bool force)
 	{
+		if (threadId == std::this_thread::get_id() && !force)
+		{
+			fn();
+			return;
+		}
+
 		// add to the queue
 		callbacks.push(fn);
 
+		// signal the waiting thread
+		SignalThread();
+	}
+
+	void GameServer::CallbackListBase::Run()
+	{
+		std::function<void()> fn;
+
+		while (callbacks.try_pop(fn))
+		{
+			fn();
+		}
+	}
+
+	void GameServer::CallbackListNng::SignalThread()
+	{
 		// submit to the owning thread
 		static thread_local nng_socket sockets[2];
 		static thread_local nng_dialer dialers[2];
 
 		int i = m_socketIdx;
 
-		if (!sockets[i])
+		if (!sockets[i].id)
 		{
 			nng_req0_open(&sockets[i]);
 			nng_dial(sockets[i], m_socketName.c_str(), &dialers[i], 0);
@@ -416,18 +688,19 @@ namespace fx
 		nng_send(sockets[i], &idxList[0], idxList.size() * sizeof(int), NNG_FLAG_NONBLOCK);
 	}
 
-	void GameServer::CallbackList::Run()
+	void GameServer::CallbackListUv::SignalThread()
 	{
-		std::function<void()> fn;
+		auto async = m_async.lock();
 
-		while (callbacks.try_pop(fn))
+		if (async)
 		{
-			fn();
+			uv_async_send((*async)->get());
 		}
 	}
 
 	void GameServer::ProcessServerFrame(int frameTime)
 	{
+		MonoEnsureThreadAttached();
 		m_seContext->MakeCurrent();
 
 		m_serverTime += frameTime;
@@ -461,7 +734,7 @@ namespace fx
 					outMsg.Write(0x53FFFA3F);
 					outMsg.Write(0);
 
-					client->SendPacket(0, outMsg, NetPacketType_Reliable);
+					client->SendPacket(0, outMsg, NetPacketType_Unreliable);
 				}
 
 				// time out the client if needed
@@ -488,15 +761,43 @@ namespace fx
 
 				if (!masterName.empty())
 				{
-					// find a cached address
-					auto it = m_masterCache.find(masterName);
-
-					if (it != m_masterCache.end())
+					if (masterName.find("https://") != 0 && masterName.find("http://") != 0)
 					{
-						// send a heartbeat to the master
-						SendOutOfBand(it->second, "heartbeat DarkPlaces\n");
+						// find a cached address
+						auto it = m_masterCache.find(masterName);
 
+						if (it != m_masterCache.end())
+						{
+							// send a heartbeat to the master
+							SendOutOfBand(it->second, "heartbeat DarkPlaces\n");
+
+							trace("Sending heartbeat to %s\n", masterName);
+						}
+					}
+					else
+					{
 						trace("Sending heartbeat to %s\n", masterName);
+
+						auto json = nlohmann::json::object({
+							{ "port", m_instance->GetComponent<fx::TcpListenManager>()->GetPrimaryPort() },
+							{ "listingToken", m_instance->GetComponent<ServerLicensingComponent>()->GetListingToken() },
+							{ "ipOverride", m_listingIpOverride->GetValue() },
+							{ "useDirectListing", m_useDirectListing->GetValue() },
+						});
+
+						HttpRequestOptions ro;
+						ro.ipv4 = true;
+						ro.headers = std::map<std::string, std::string>{
+							{ "Content-Type", "application/json; charset=utf-8" }
+						};
+
+						Instance<HttpClient>::Get()->DoPostRequest(masterName, json.dump(), ro, [](bool success, const char* d, size_t s)
+						{
+							if (!success)
+							{
+								trace("error submitting to ingress: %s\n", std::string{ d, s });
+							}
+						});
 					}
 				}
 			}
@@ -511,12 +812,23 @@ namespace fx
 			ctx->ExecuteBuffer();
 		}
 
+		if (m_gamename->GetHelper()->GetValue() != m_lastGameName)
+		{
+			if (!m_lastGameName.empty())
+			{
+				console::PrintError("server", "Reverted a `gamename` change. You can't change gamename while the server is running!\n");
+				m_gamename->GetHelper()->SetValue(m_lastGameName);
+			}
+
+			m_lastGameName = m_gamename->GetHelper()->GetValue();
+		}
+
 		OnTick();
 	}
 
-	void GameServer::DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const fmt::ArgList& args)
+	void GameServer::DropClientv(const std::shared_ptr<Client>& client, const std::string& reason, fmt::printf_args args)
 	{
-		std::string realReason = fmt::sprintf(reason, args);
+		std::string realReason = fmt::vsprintf(reason, args);
 
 		if (reason.empty())
 		{
@@ -531,6 +843,9 @@ namespace fx
 
 		// force a hearbeat
 		ForceHeartbeat();
+
+		// ensure mono thread attachment (if this was a worker thread)
+		MonoEnsureThreadAttached();
 
 		// trigger a event signaling the player's drop
 		m_instance
@@ -563,8 +878,11 @@ namespace fx
 			// for name handling, send player state
 			fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
 
-			// send every player information about the joining client
-			events->TriggerClientEvent("onPlayerDropped", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
+			if (!fx::IsBigMode())
+			{
+				// send every player information about the dropping client
+				events->TriggerClientEventReplayed("onPlayerDropped", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
+			}
 		}
 
 		// drop the client
@@ -578,7 +896,12 @@ namespace fx
 
 	void GameServer::SendOutOfBand(const net::PeerAddress& to, const std::string_view& oob, bool prefix)
 	{
-		m_net->SendOutOfBand(to, oob, prefix);
+		std::string oobStr(oob);
+
+		gscomms_execute_callback_on_net_thread([this, to, oobStr, prefix]()
+		{
+			m_net->SendOutOfBand(to, oobStr, prefix);
+		});
 	}
 
 	fwRefContainer<GameServerNetBase> CreateGSNet(fx::GameServer* server)
@@ -739,6 +1062,13 @@ namespace fx
 		{
 			void Process(const fwRefContainer<fx::GameServer>& server, const net::PeerAddress& from, const std::string_view& dataView) const
 			{
+				auto limiter = server->GetInstance()->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("rcon", fx::RateLimiterDefaults{ 0.2, 5.0 });
+
+				if (!limiter->Consume(from))
+				{
+					return;
+				}
+
 				std::string data(dataView);
 
 				gscomms_execute_callback_on_main_thread([=]()
@@ -759,11 +1089,6 @@ namespace fx
 
 						std::string printString;
 
-						PrintListenerContext context([&](const std::string_view& print)
-						{
-							printString += print;
-						});
-
 						ScopeDestructor destructor([&]()
 						{
 							server->SendOutOfBand(from, "print " + printString);
@@ -771,15 +1096,26 @@ namespace fx
 
 						if (serverPassword.empty())
 						{
-							trace("The server must set rcon_password to be able to use this command.\n");
+							printString += "The server must set rcon_password to be able to use this command.\n";
 							return;
 						}
 
 						if (password != serverPassword)
 						{
-							trace("Invalid password.\n");
+							printString += "Invalid password.\n";
 							return;
 						}
+
+						// log rcon request
+						trace("Rcon from %s\n%s\n", from.ToString(), command);
+
+						// reset rate limit for this key
+						limiter->Reset(from);
+
+						PrintListenerContext context([&](const std::string_view& print)
+						{
+							printString += print;
+						});
 
 						auto ctx = server->GetInstance()->GetComponent<console::Context>();
 						ctx->ExecuteBuffer();
@@ -1004,9 +1340,9 @@ DECLARE_INSTANCE_TYPE(fx::ServerDecorators::HostVoteCount);
 #include <decorators/WithProcessTick.h>
 #include <decorators/WithPacketHandler.h>
 
-void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn)
+void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn, bool force)
 {
-	g_gameServer->InternalAddMainThreadCb(fn);
+	g_gameServer->InternalAddMainThreadCb(fn, force);
 }
 
 void gscomms_execute_callback_on_net_thread(const std::function<void()>& fn)
@@ -1022,11 +1358,11 @@ void gscomms_reset_peer(int peer)
 	});
 }
 
-void gscomms_send_packet(int peer, int channel, const net::Buffer& buffer, NetPacketType flags)
+void gscomms_send_packet(const std::shared_ptr<fx::Client>& client, int peer, int channel, const net::Buffer& buffer, NetPacketType flags)
 {
 	gscomms_execute_callback_on_net_thread([=]()
 	{
-		g_gameServer->InternalSendPacket(peer, channel, buffer, flags);
+		g_gameServer->InternalSendPacket(client, peer, channel, buffer, flags);
 	});
 }
 
@@ -1056,6 +1392,22 @@ static InitFunction initFunction([]()
 			)
 		);
 
+		instance->SetComponent(new fx::PeerAddressRateLimiterStore(instance->GetComponent<console::Context>().GetRef()));
 		instance->SetComponent(new fx::ServerDecorators::HostVoteCount());
 	});
+
+	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
+	{
+		auto consoleCtx = instance->GetComponent<console::Context>();
+
+		// start sessionmanager
+		if (instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::RDR3)
+		{
+			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "sessionmanager-rdr3" });
+		}
+		else
+		{
+			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "sessionmanager" });
+		}
+	}, INT32_MAX);
 });

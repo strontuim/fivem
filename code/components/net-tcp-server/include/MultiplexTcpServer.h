@@ -10,6 +10,8 @@
 #include "TcpServer.h"
 #include "TcpServerFactory.h"
 
+#include <mutex>
+
 #ifdef COMPILING_NET_TCP_SERVER
 #define TCP_SERVER_EXPORT DLL_EXPORT
 #else
@@ -48,7 +50,13 @@ public:
 
 	virtual void Write(const std::string& data) override;
 
+	virtual void Write(std::vector<uint8_t>&& data) override;
+
+	virtual void Write(std::string&& data) override;
+
 	virtual void Close() override;
+
+	virtual void ScheduleCallback(const TScheduledCallback& callback) override;
 };
 
 enum class MultiplexPatternMatchResult
@@ -64,6 +72,8 @@ class MultiplexTcpChildServer : public TcpServer
 {
 private:
 	MultiplexPatternMatchFn m_patternMatcher;
+
+	std::mutex m_connectionsMutex;
 
 	std::set<fwRefContainer<TcpServerStream>> m_connections;
 

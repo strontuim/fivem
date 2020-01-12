@@ -7,14 +7,20 @@
 
 #include "StdInc.h"
 
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+#include <Hooking.h>
+
+#if defined(IS_RDR3)
+static uintptr_t g_currentStub = 0x148000000;
+#else
 static uintptr_t g_currentStub = 0x146000000;
+#endif
 
 extern "C"
 {
 	DLL_EXPORT void* AllocateFunctionStubImpl(void* function, int type)
 	{
-		char* code = (char*)g_currentStub;
+		char* code = (char*)g_currentStub + hook::baseAddressDifference;
 
 		DWORD oldProtect;
 		VirtualProtect(code, 15, PAGE_EXECUTE_READWRITE, &oldProtect);
@@ -29,6 +35,18 @@ extern "C"
 		*(uint64_t*)(code + 12) = 0xCCCCCCCCCCCCCCCC;
 
 		g_currentStub += 20;
+
+		return code;
+	}
+
+	DLL_EXPORT void* AllocateStubMemoryImpl(size_t size)
+	{
+		char* code = (char*)g_currentStub + hook::baseAddressDifference;
+
+		DWORD oldProtect;
+		VirtualProtect(code, size, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+		g_currentStub += size;
 
 		return code;
 	}

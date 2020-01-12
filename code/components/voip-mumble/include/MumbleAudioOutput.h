@@ -38,7 +38,11 @@ public:
 
 	void HandleClientConnect(const MumbleUser& user);
 
+	void HandleClientDistance(const MumbleUser& user, float distance);
+
 	void HandleClientPosition(const MumbleUser& user, float position[3]);
+
+	void HandleClientVolumeOverride(const MumbleUser& user, float volume);
 
 	void HandleClientVoiceData(const MumbleUser& user, uint64_t sequence, const uint8_t* data, size_t size);
 
@@ -66,6 +70,8 @@ private:
 		uint64_t sequence;
 		float volume;
 		float position[3];
+		float distance;
+		float overrideVolume;
 		bool isTalking;
 		bool isAudible;
 		OpusDecoder* opus;

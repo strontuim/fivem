@@ -21,15 +21,15 @@
 		<ul class="desc">
 			<li *ngIf="server && server.data.gametype">
 				<span class="key">Game type:</span>
-				{{(server && server.data.gametype)||'Game type'}}
+				<span>{{(server && server.data.gametype)||'Game type'}}</span>
 			</li>
 			<li *ngIf="server && server.data.mapname">
 				<span class="key">Map:</span>
-				{{(server && server.data.mapname)||'Map name'}}
+				<span>{{(server && server.data.mapname)||'Map name'}}</span>
 			</li>
 			<li class="address">
 				<span class="key">Address:</span>
-				<span class="select">{{(server && server.address)||'undefined'}}</span>
+				<span class="select">{{(serverAddress)||'undefined'}}</span>
 			</li>
 			<li>
 				<span class="key">Players:</span>
@@ -67,17 +67,20 @@
 	</div>
 
 
-	<div class="info player-list" *ngIf="this.server">
+	<div class="info player-list" *ngIf="this.server" [class.withBanner]="this.server && this.server.data.vars && this.server.data.vars.banner_detail">
 		<h1 translate>#ServerDetail_Players</h1>
 		<span *ngIf="server.data.players.length == 0" translate>#ServerDetail_PlayersEmpty</span>
-		<ul>
+		<ul [class.huge]="server && server.data && server.data.players.length > 64">
 			<li *ngFor="let player of server.data.players"><app-player-avatar [player]="player"></app-player-avatar>
 				<span>
 					{{player.name}}
 				</span></li>
 		</ul>
+		<div class="count">{{server.data.players.length}}</div>
 	</div>
 
-	<div class="info resource-list" *ngIf="this.server">
-		{{ resourceString }}
+	<div class="info resource-list" *ngIf="this.server" [class.withBanner]="this.server && this.server.data.vars && this.server.data.vars.banner_detail">
+		<p>{{ resourceString }}</p>
+
+		<div class="count">{{ resourceCount }}</div>
 	</div>

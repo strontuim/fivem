@@ -59,10 +59,13 @@ static InitFunction initFunction([]()
 				auto responseHeaders = std::make_shared<HttpHeaderList>();
 				auto responseCode = std::make_shared<int>();
 
+				using namespace std::chrono_literals;
+
 				HttpRequestOptions options;
 				options.headers = headerMap;
 				options.responseHeaders = responseHeaders;
 				options.responseCode = responseCode;
+				options.timeoutNoResponse = 5000ms;
 
 				// create token
 				int token = reqToken.fetch_add(1);
@@ -72,11 +75,11 @@ static InitFunction initFunction([]()
 				{
 					if (!success)
 					{
-						evComponent->QueueEvent2("__cfx_internal:httpResponse", {}, token, 0, msgpack::type::nil{}, std::map<std::string, std::string>());
+						evComponent->QueueEvent2("__cfx_internal:httpResponse", {}, token, *responseCode, msgpack::type::nil{}, std::map<std::string, std::string>());
 					}
 					else
 					{
-						evComponent->QueueEvent2("__cfx_internal:httpResponse", {}, token, responseCode, std::string{ data, length }, *responseHeaders);
+						evComponent->QueueEvent2("__cfx_internal:httpResponse", {}, token, *responseCode, std::string{ data, length }, *responseHeaders);
 					}
 				});
 

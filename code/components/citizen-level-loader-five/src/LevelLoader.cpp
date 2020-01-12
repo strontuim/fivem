@@ -13,6 +13,11 @@
 
 #include <scrEngine.h>
 
+#include <ResourceManager.h>
+#include <ResourceMetaDataComponent.h>
+
+#include <skyr/url.hpp>
+
 #include "Hooking.h"
 
 static std::string g_overrideNextLoadedLevel;
@@ -201,7 +206,10 @@ static void LoadLevel(const char* levelName)
 
 	if (!gameInit->GetGameLoaded())
 	{
-		rage::scrEngine::CreateThread(&spawnThread);
+		if (!gameInit->HasVariable("storyMode") && !gameInit->HasVariable("localMode"))
+		{
+			rage::scrEngine::CreateThread(&spawnThread);
+		}
 
 		gameInit->LoadGameFirstLaunch([] ()
 		{
@@ -210,13 +218,56 @@ static void LoadLevel(const char* levelName)
 	}
 	else
 	{
-		gameInit->KillNetwork((wchar_t*)1);
+		//gameInit->KillNetwork((wchar_t*)1);
 
 		gameInit->ReloadGame();
 	}
 
 	gameInit->ShAllowed = true;
 }
+
+class SPResourceMounter : public fx::ResourceMounter
+{
+public:
+	SPResourceMounter(fx::ResourceManager* manager)
+		: m_manager(manager)
+	{
+
+	}
+
+	virtual bool HandlesScheme(const std::string& scheme) override
+	{
+		return (scheme == "file");
+	}
+
+	virtual pplx::task<fwRefContainer<fx::Resource>> LoadResource(const std::string& uri) override
+	{
+		auto uriParsed = skyr::make_url(uri);
+
+		fwRefContainer<fx::Resource> resource;
+
+		if (uriParsed)
+		{
+			auto pathRef = uriParsed->pathname();
+			auto fragRef = uriParsed->hash().substr(1);
+
+			if (!pathRef.empty() && !fragRef.empty())
+			{
+				std::vector<char> path;
+				std::string pr = pathRef.substr(1);
+				//network::uri::decode(pr.begin(), pr.end(), std::back_inserter(path));
+
+				resource = m_manager->CreateResource(fragRef);
+				resource->LoadFrom(pr);
+			}
+		}
+
+		return pplx::task_from_result<fwRefContainer<fx::Resource>>(resource);
+	}
+
+private:
+	fx::ResourceManager* m_manager;
+};
 
 static InitFunction initFunction([] ()
 {
@@ -232,6 +283,46 @@ static InitFunction initFunction([] ()
 	static ConsoleCommand loadLevelCommand("loadlevel", [](const std::string& level)
 	{
 		LoadLevel(level.c_str());
+	});
+
+	static ConsoleCommand storyModeyCommand("storymode", []()
+	{
+		Instance<ICoreGameInit>::Get()->SetVariable("storyMode");
+		LoadLevel("gta5");
+	});
+
+	static ConsoleCommand localGameCommand("localGame", [](const std::string& resourceDir)
+	{
+		Instance<ICoreGameInit>::Get()->SetVariable("localMode");
+
+		fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
+		resourceManager->AddMounter(new SPResourceMounter(resourceManager));
+
+		auto resourceRoot = "usermaps:/resources/" + resourceDir;
+
+		skyr::url_record record;
+		record.scheme = "file";
+
+		skyr::url url{ std::move(record) };
+		url.set_pathname(resourceRoot);
+		url.set_hash(resourceDir);
+
+		resourceManager->AddResource(url.href())
+			.then([](fwRefContainer<fx::Resource> resource)
+		{
+			resource->Start();
+		});
+
+		static ConsoleCommand localRestartCommand("localRestart", [resourceRoot, resourceDir, resourceManager]()
+		{
+			auto res = resourceManager->GetResource(resourceDir);
+			res->GetComponent<fx::ResourceMetaDataComponent>()->LoadMetaData(resourceRoot);
+
+			res->Stop();
+			res->Start();
+		});
+
+		LoadLevel("gta5");
 	});
 
 	static ConsoleCommand loadLevelCommand2("invoke-levelload", [](const std::string& level)

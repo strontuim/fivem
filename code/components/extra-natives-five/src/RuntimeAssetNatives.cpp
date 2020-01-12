@@ -19,6 +19,8 @@
 
 #include <grcTexture.h>
 
+#include <RageParser.h>
+
 #include <wrl.h>
 #include <wincodec.h>
 
@@ -29,6 +31,8 @@
 #include <ResourceCacheDevice.h>
 #include <ResourceManager.h>
 #include <json.hpp>
+
+#include <atPool.h>
 
 #include <concurrent_unordered_set.h>
 
@@ -101,7 +105,7 @@ RuntimeTex::RuntimeTex(const char* name, int width, int height)
 
 	rage::grcLockedTexture lockedTexture;
 
-	if (m_texture->Map(1, 0, &lockedTexture, rage::grcLockFlags::Write))
+	if (m_texture->Map(0, 0, &lockedTexture, rage::grcLockFlags::Write))
 	{
 		memset(lockedTexture.pBits, 0, lockedTexture.pitch * lockedTexture.height);
 		m_backingPixels.resize(lockedTexture.pitch * lockedTexture.height);
@@ -171,7 +175,7 @@ bool RuntimeTex::SetPixelData(const void* data, size_t length)
 
 	rage::grcLockedTexture lockedTexture;
 
-	if (m_texture->Map(1, 0, &lockedTexture, rage::grcLockFlags::Write))
+	if (m_texture->Map(0, 0, &lockedTexture, rage::grcLockFlags::Write))
 	{
 		memcpy(lockedTexture.pBits, data, length);
 		memcpy(m_backingPixels.data(), data, length);
@@ -185,7 +189,7 @@ void RuntimeTex::Commit()
 {
 	rage::grcLockedTexture lockedTexture;
 
-	if (m_texture->Map(1, 0, &lockedTexture, rage::grcLockFlags::Write))
+	if (m_texture->Map(0, 0, &lockedTexture, rage::grcLockFlags::Write))
 	{
 		memcpy(lockedTexture.pBits, m_backingPixels.data(), m_backingPixels.size());
 		m_texture->Unmap(&lockedTexture);
@@ -197,7 +201,7 @@ RuntimeTxd::RuntimeTxd(const char* name)
 	streaming::Manager* streaming = streaming::Manager::GetInstance();
 	auto txdStore = streaming->moduleMgr.GetStreamingModule("ytd");
 
-	txdStore->GetOrCreate(&m_txdIndex, name);
+	txdStore->FindSlotFromHashKey(&m_txdIndex, name);
 
 	if (m_txdIndex != 0xFFFFFFFF)
 	{
@@ -211,7 +215,7 @@ RuntimeTxd::RuntimeTxd(const char* name)
 			streaming::strAssetReference ref;
 			ref.asset = m_txd;
 
-			txdStore->SetAssetReference(m_txdIndex, ref);
+			txdStore->SetResource(m_txdIndex, ref);
 			entry.flags = (512 << 8) | 1;
 		}
 	}
@@ -250,7 +254,7 @@ RuntimeTex* RuntimeTxd::CreateTextureFromDui(const char* name, const char* duiHa
 		return nullptr;
 	}
 
-	auto tex = std::make_shared<RuntimeTex>(nui::GetWindowTexture(duiHandle));
+	auto tex = std::make_shared<RuntimeTex>((rage::grcTexture*)nui::GetWindowTexture(duiHandle)->GetHostTexture());
 	m_txd->Add(name, tex->GetTexture());
 
 	m_textures[name] = tex;
@@ -434,186 +438,10 @@ struct GetRagePageFlagsExtension
 
 void DLL_IMPORT CfxCollection_AddStreamingFileByTag(const std::string& tag, const std::string& fileName, rage::ResourceFlags flags);
 
-namespace rage
-{
-	enum class parMemberType : uint8_t
-	{
-		Bool = 0,
-		Int8 = 1,
-		UInt8 = 2,
-		Int16 = 3,
-		UInt16 = 4,
-		Int32 = 5,
-		UInt32 = 6,
-		Float = 7,
-		Vector2 = 8,
-		Vector3 = 9,
-		Vector4 = 10,
-		String = 11,
-		Struct = 12,
-		Array = 13,
-		Enum = 14,
-		Bitset = 15,
-		Map = 16,
-		Matrix4x3 = 17,
-		Matrix4x4 = 18,
-		Vector2_Padded = 19,
-		Vector3_Padded = 20,
-		Vector4_Padded = 21,
-		Matrix3x4 = 22,
-		Matrix4x3_2 = 23,
-		Matrix4x4_2 = 24,
-		Vector1_Padded = 25,
-		Flag1_Padded = 26, // for shaders?
-		Flag4_Padded = 27,
-		Int32_64 = 28,
-		Int32_U64 = 29,
-		Half = 30,
-		Int64 = 31,
-		UInt64 = 32,
-		Double = 33
-	};
-
-	struct parEnumField
-	{
-		uint32_t hash;
-		uint32_t index; // 0xFFFFFFFF for last
-	};
-
-	struct parEnumDefinition
-	{
-		parEnumField* fields;
-	};
-
-	enum class parArrayType : uint8_t
-	{
-		// type is atArray
-		atArray = 0,
-
-		// count*size, trailing integer (after alignment)
-		FixedTrailingCount = 1,
-
-		// count*size, fixed
-		Fixed = 2,
-
-		// pointer to count*size
-		FixedPointer = 3,
-
-		// unknown difference from 2
-		Fixed_2 = 4,
-
-		// atArray but with uint32_t index
-		atArray32 = 5,
-
-		// pointer with a trailing count at +size
-		TrailerInt = 6,
-
-		TrailerByte = 7,
-
-		TrailerShort = 8
-	};
-
-	enum class parStructType : uint8_t
-	{
-		// not a pointer, just the offset
-		Inline = 0,
-
-		// other types
-		Struct_1 = 1,
-		Struct_2 = 2,
-		Struct_3 = 3,
-		Struct_4 = 4,
-	};
-
-	class parStructure;
-
-	struct parMemberDefinition
-	{
-		uint32_t hash; // +0
-		uint32_t pad; // +4
-		uint64_t offset; // +8
-		parMemberType type; // +16
-		union
-		{
-			parArrayType arrayType; // +17
-			parStructType structType;
-		};
-		uint8_t pad2[2]; // +18
-		uint8_t pad3[12]; // +20
-		union // +32
-		{
-			uint32_t arrayElemSize;
-			uint64_t __pad;
-			parStructure* structure;
-		};
-		union // +40
-		{
-			parEnumDefinition* enumData;
-			uint32_t arrayElemCount;
-		};
-	};
-
-	class parMember
-	{
-	public:
-		virtual ~parMember() = default;
-
-		parMemberDefinition* m_definition;
-		parMember* m_arrayDefinition; // in case of array
-	};
-
-	class parStructure
-	{
-	public:
-		virtual ~parStructure() = default;
-
-		uint32_t m_nameHash; // +8
-
-		char m_pad[4]; // +12
-
-		parStructure* m_baseClass; // +16
-
-		char m_pad2[24]; // +24
-
-		atArray<rage::parMember*> m_members; // +48
-
-		char m_pad3[8];
-
-		void* m_newPtr; // +72
-		void*(*m_new)();
-
-		void* m_placementNewPtr;
-		void*(*m_placementNew)(void*);
-
-		void* m_getTypePtr;
-		parStructure*(*m_getType)(void*);
-
-		void* m_deletePtr;
-		void(*m_delete)(void*);
-	};
-}
-
 static hook::cdecl_stub<void(fwArchetype*)> registerArchetype([]()
 {
 	return hook::get_pattern("48 8B D9 8A 49 60 80 F9", -11);
 });
-
-static void** g_parser;
-
-static hook::cdecl_stub<rage::parStructure*(void* parser, uint32_t)> _parser_getStructure([]()
-{
-	return hook::get_pattern("74 30 44 0F B7 41 38 33 D2", -0xB);
-});
-
-static rage::parStructure* GetStructureDefinition(const char* structType)
-{
-	return _parser_getStructure(*g_parser, HashRageString(structType));
-}
-
-static rage::parStructure* GetStructureDefinition(uint32_t structHash)
-{
-	return _parser_getStructure(*g_parser, structHash);
-}
 
 static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, msgpack::object>& data, void* old = nullptr);
 
@@ -979,11 +807,11 @@ static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, ms
 		}
 	}
 
-	auto structDef = GetStructureDefinition(hash);
+	auto structDef = rage::GetStructureDefinition(hash);
 
 	if (!structTypeReal.empty())
 	{
-		structDef = GetStructureDefinition(structTypeReal.c_str());
+		structDef = rage::GetStructureDefinition(structTypeReal.c_str());
 	}
 
 	if (!structDef)
@@ -1022,14 +850,6 @@ static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, ms
 
 	return retval;
 }
-
-static HookFunction hookFunction([]()
-{
-	g_parser = hook::get_address<void**>(hook::get_pattern("48 8B 0D ? ? ? ? 48 8D 54 24 48 41 B0 01", 3));
-
-	// test
-	//hook::put<uint8_t>(hook::get_pattern("FF FF 45 84 ED 75 04 33 C0 EB", 5), 0xEB);
-});
 
 static hook::cdecl_stub<CMapDataContents*()> makeMapDataContents([]()
 {
@@ -1151,6 +971,16 @@ static InitFunction initFunction([]()
 					factoryObject.as<std::vector<std::map<std::string, msgpack::object>>>() :
 					std::vector<std::map<std::string, msgpack::object>>{ factoryObject.as<std::map<std::string, msgpack::object>>() };
 
+				static int idx;
+				std::string nameRef = fmt::sprintf("reg_ents_%d", idx++);
+
+				CMapData* mapData = new CMapData();
+
+				// 1604, temp
+				*(uintptr_t*)mapData = 0x1419343E0;
+				mapData->name = HashString(nameRef.c_str());
+				mapData->contentFlags = 73;
+
 				float aabbMin[3];
 				float aabbMax[3];
 
@@ -1162,33 +992,35 @@ static InitFunction initFunction([]()
 				aabbMax[1] = 0.0f - FLT_MAX;
 				aabbMax[2] = 0.0f - FLT_MAX;
 
-				// TODO: replace this logic with 'proper' fwMapData
-
-				CMapDataContents* contents = makeMapDataContents();
-				contents->entities = new void*[entities.size()];
-				memset(contents->entities, 0, sizeof(void*) * entities.size());
+				mapData->entities.Expand(entities.size());
 
 				size_t i = 0;
 
 				for (const auto& entityData : entities)
 				{
 					fwEntityDef* entityDef = (fwEntityDef*)MakeStructFromMsgPack("CEntityDef", entityData);
+					mapData->entities.Set(i, entityDef);
 
 					uint64_t archetypeUnk = 0xFFFFFFF;
 					fwArchetype* archetype = GetArchetypeSafe(entityDef->archetypeName, &archetypeUnk);
 
 					if (archetype)
 					{
-						void* entity = fwEntityDef__instantiate(entityDef, 0, archetype, &archetypeUnk);
+						float radius = archetype->radius;
+
+						if (archetype->radius < 0.01f)
+						{
+							radius = 250.f;
+						}
 
 						// update AABB
-						float xMin = entityDef->position[0] - archetype->radius;
-						float yMin = entityDef->position[1] - archetype->radius;
-						float zMin = entityDef->position[2] - archetype->radius;
+						float xMin = entityDef->position[0] - radius;
+						float yMin = entityDef->position[1] - radius;
+						float zMin = entityDef->position[2] - radius;
 
-						float xMax = entityDef->position[0] + archetype->radius;
-						float yMax = entityDef->position[1] + archetype->radius;
-						float zMax = entityDef->position[2] + archetype->radius;
+						float xMax = entityDef->position[0] + radius;
+						float yMax = entityDef->position[1] + radius;
+						float zMax = entityDef->position[2] + radius;
 
 						aabbMin[0] = (xMin < aabbMin[0]) ? xMin : aabbMin[0];
 						aabbMin[1] = (yMin < aabbMin[1]) ? yMin : aabbMin[1];
@@ -1197,28 +1029,67 @@ static InitFunction initFunction([]()
 						aabbMax[0] = (xMax > aabbMax[0]) ? xMax : aabbMax[0];
 						aabbMax[1] = (yMax > aabbMax[1]) ? yMax : aabbMax[1];
 						aabbMax[2] = (zMax > aabbMax[2]) ? zMax : aabbMax[2];
-
-						contents->entities[i] = entity;
-						i++;
 					}
+
+					i++;
 				}
 
-				contents->numEntities = i;
+				mapData->entitiesExtentsMin[0] = aabbMin[0];
+				mapData->entitiesExtentsMin[1] = aabbMin[1];
+				mapData->entitiesExtentsMin[2] = aabbMin[2];
 
-				CMapData mapData = { 0 };
-				mapData.aabbMax[0] = aabbMax[0];
-				mapData.aabbMax[1] = aabbMax[1];
-				mapData.aabbMax[2] = aabbMax[2];
-				mapData.aabbMax[3] = FLT_MAX;
+				mapData->entitiesExtentsMax[0] = aabbMax[0];
+				mapData->entitiesExtentsMax[1] = aabbMax[1];
+				mapData->entitiesExtentsMax[2] = aabbMax[2];
 
-				mapData.aabbMin[0] = aabbMin[0];
-				mapData.aabbMin[1] = aabbMin[1];
-				mapData.aabbMin[2] = aabbMin[2];
-				mapData.aabbMin[3] = 0.0f - FLT_MAX;
+				mapData->streamingExtentsMin[0] = aabbMin[0];
+				mapData->streamingExtentsMin[1] = aabbMin[1];
+				mapData->streamingExtentsMin[2] = aabbMin[2];
 
-				mapData.unkBool = 2;
+				mapData->streamingExtentsMax[0] = aabbMax[0];
+				mapData->streamingExtentsMax[1] = aabbMax[1];
+				mapData->streamingExtentsMax[2] = aabbMax[2];
 
-				addToScene(contents, &mapData, false, false);
+				auto mapTypesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+				auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
+				
+				uint32_t mehId;
+				mapTypesStore->FindSlot(&mehId, "v_int_1");
+
+				uint32_t mapId;
+				mapDataStore->FindSlotFromHashKey(&mapId, nameRef.c_str());
+
+				if (mapId != -1)
+				{
+					void* unkRef[4] = { 0 };
+					unkRef[0] = mapData;
+
+					// 1604, temp (pso store placement cookie)
+					((void(*)(void*, uint32_t, const void*))0x14158FCD4)((void*)0x142DC9678, mapId + mapDataStore->baseIdx, unkRef);
+
+					auto pool = (atPoolBase*)((char*)mapDataStore + 56);
+					*(int32_t*)(pool->GetAt<char>(mapId) + 32) |= 2048;
+					*(int16_t*)(pool->GetAt<char>(mapId) + 38) = 1;
+					*(int32_t*)(pool->GetAt<char>(mapId) + 24) = mehId; // TODO: FIGURE OUT
+
+					//auto contents = (CMapDataContents*)mapDataStore->GetPtr(mapId);
+					auto mapMeta = (void*)mapDataStore->GetDataPtr(mapId); // not sure?
+
+					// TODO: leak
+					mapData->CreateMapDataContents()->PrepareInteriors(mapMeta, mapData, mapId);
+					
+					// reference is ignored but we pass it for formality - it actually uses PSO store placement cookies
+					streaming::strAssetReference ref;
+					ref.asset = mapData;
+
+					mapDataStore->SetResource(mapId, ref);
+					streaming::Manager::GetInstance()->Entries[mapId + mapDataStore->baseIdx].flags |= (512 << 8) | 1;
+
+					// 1604
+					((void(*)(int))0x1408CF07C)(0);
+
+					((void(*)(void*))((*(void***)0x142DCA970)[2]))((void*)0x142DCA970);
+				}
 			}
 		}
 	});

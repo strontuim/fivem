@@ -19,6 +19,8 @@
 
 #include <ICoreGameInit.h>
 
+#include <Error.h>
+
 #include <Hooking.h>
 
 static bool Splitter(bool split_vertically, float thickness, float* size1, float* size2, float min_size1, float min_size2, float splitter_long_axis_size = -1.0f)
@@ -30,7 +32,7 @@ static bool Splitter(bool split_vertically, float thickness, float* size1, float
 	ImRect bb;
 	bb.Min = window->DC.CursorPos + (split_vertically ? ImVec2(*size1, 0.0f) : ImVec2(0.0f, *size1));
 	bb.Max = bb.Min + CalcItemSize(split_vertically ? ImVec2(thickness, splitter_long_axis_size) : ImVec2(splitter_long_axis_size, thickness), 0.0f, 0.0f);
-	return SplitterBehavior(id, bb, split_vertically ? ImGuiAxis_X : ImGuiAxis_Y, size1, size2, min_size1, min_size2, 0.0f);
+	return SplitterBehavior(bb, id, split_vertically ? ImGuiAxis_X : ImGuiAxis_Y, size1, size2, min_size1, min_size2, 0.0f);
 }
 
 namespace rage
@@ -121,6 +123,19 @@ namespace rage
 
 		netSyncNodeBase* firstChild;
 	};
+
+	class netSyncDataNodeBase : public netSyncNodeBase
+	{
+	public:
+		uint32_t flags;
+		uint32_t pad3;
+		uint64_t pad4;
+		netSyncDataNodeBase* parentData; //0x50
+		uint32_t childCount;
+		netSyncDataNodeBase* children[8];
+		uint8_t syncFrequencies[8];
+		void* nodeBuffer;
+	};
 }
 
 static rage::netObject* g_curNetObjectSelection;
@@ -164,11 +179,11 @@ static void RenderSyncTree(rage::netObject* object, rage::netSyncTree* syncTree)
 
 static void RenderNetObjectTree()
 {
-	for (int player = 0; player < 64 + 1; player++)
+	for (int player = 0; player < 128 + 1; player++)
 	{
 		std::vector<rage::netObject*> objects;
 
-		rage::netObjectMgr::GetInstance()->ForAllNetObjects(player, [&objects](rage::netObject* object)
+		CloneObjectMgr->ForAllNetObjects(player, [&objects](rage::netObject* object)
 		{
 			objects.push_back(object);
 		});
@@ -306,6 +321,8 @@ static TSyncLog TraverseSyncTree(TSyncLog* old, int oldId, rage::netSyncTree* sy
 
 #include <array>
 
+void DirtyNode(void* object, void* node);
+
 namespace rage
 {
 struct WriteTreeState
@@ -322,7 +339,7 @@ struct WriteTreeState
 
 struct NetObjectNodeData
 {
-	std::array<uint8_t, 768> lastData;
+	std::array<uint8_t, 1024> lastData;
 	uint32_t lastChange;
 	uint32_t lastAck;
 
@@ -449,7 +466,7 @@ bool netSyncTree::WriteTreeCfx(int flags, int objFlags, rage::netObject* object,
 				uint32_t nodeSyncDelay = GetDelayForUpdateFrequency(node->GetUpdateFrequency(UpdateLevel::VERY_HIGH));
 
 				// calculate node change state
-				std::array<uint8_t, 768> tempData;
+				std::array<uint8_t, 1024> tempData;
 				memset(tempData.data(), 0, tempData.size());
 
 				rage::datBitBuffer tempBuf(tempData.data(), (sizeLength == 11) ? 256 : tempData.size());
@@ -514,6 +531,18 @@ bool netSyncTree::WriteTreeCfx(int flags, int objFlags, rage::netObject* object,
 			{
 				state.wroteAny = true;
 
+				if (node->IsDataNode())
+				{
+					auto dataNode = (rage::netSyncDataNodeBase*)node;
+
+					static_assert(offsetof(rage::netSyncDataNodeBase, parentData) == 0x50, "parentData off");
+
+					for (int child = 0; child < dataNode->childCount; child++)
+					{
+						DirtyNode(state.object, dataNode->children[child]);
+					}
+				}
+
 				if (state.object)
 				{
 					g_netObjectNodeMapping[state.object->objectId][node] = { 1, rage::netInterface_queryFunctions::GetInstance()->GetTimestamp() };
@@ -534,6 +563,24 @@ bool netSyncTree::WriteTreeCfx(int flags, int objFlags, rage::netObject* object,
 					if (node->flags2 & state.flags)
 					{
 						length -= 1;
+					}
+
+					if (length >= (1 << 13))
+					{
+						auto extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info.bin");
+
+						auto f = _wfopen(extraDumpPath.c_str(), L"wb");
+
+						if (f)
+						{
+							fwrite(buffer->m_data, 1, buffer->m_maxBit / 8, f);
+							fclose(f);
+						}
+
+						trace("Node type: %s\n", typeid(*node).name());
+						trace("Start offset: %d\n", startPos);
+
+						FatalError("Tried to write a bad node length of %d bits in a '%s'. There should only ever be 8192 bits. Please report this on https://forum.fivem.net/t/318260 together with the .zip file from 'save information' below.", length, typeid(*node).name());
 					}
 
 					buffer->WriteUns(length, sizeLength);
@@ -723,7 +770,7 @@ static InitFunction initFunction([]()
 
 		ImGui::SetNextWindowSizeConstraints(ImVec2(1020.0f, 400.0f), ImVec2(1020.0f, 2000.0f));
 
-		if (ImGui::Begin("Network Object Viewer", &novOpen))
+		if (ImGui::Begin("Network Object Viewer", &novOpen) && rage::netObjectMgr::GetInstance())
 		{
 			static float treeSize = 400.f;
 			static float detailSize = 600.f;

@@ -6,10 +6,12 @@
  */
 
 #include "StdInc.h"
+
 #include <CefOverlay.h>
 #include <NetLibrary.h>
 #include <strsafe.h>
 #include <GlobalEvents.h>
+
 #include <nutsnbolts.h>
 #include <ConsoleHost.h>
 #include <CoreConsole.h>
@@ -20,20 +22,27 @@
 #include <sstream>
 #include "KnownFolders.h"
 #include <ShlObj.h>
+#include <Shellapi.h>
+#include <HttpClient.h>
+#include <InputHook.h>
 
 #include <json.hpp>
 
 #include <CfxState.h>
 #include <HostSharedData.h>
 
-#include <network/uri.hpp>
+#include <skyr/url.hpp>
 
 #include <se/Security.h>
 
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 
+#include <LauncherIPC.h>
+
 #include <SteamComponentAPI.h>
+
+#include <MinMode.h>
 
 #include "GameInit.h"
 
@@ -81,7 +90,7 @@ void loadSettings() {
 			settingsFile.close();
 
 			//trace(va("Loaded JSON settings %s\n", json.c_str()));
-			nui::ExecuteRootScript(va("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'loadedSettings', json: %s }, '*');", settingsStream.str()));
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "loadedSettings", "json": %s })", settingsStream.str()));
 		}
 		
 		CoTaskMemFree(appDataPath);
@@ -138,18 +147,9 @@ static void ConnectTo(const std::string& hostnameStr)
 
 	g_connected = true;
 
-	auto npa = net::PeerAddress::FromString(hostnameStr);
+	nui::PostFrameMessage("mpMenu", R"({ "type": "connecting" })");
 
-	if (npa)
-	{
-		nui::ExecuteRootScript("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'connecting' }, '*');");
-
-		netLibrary->ConnectToServer(npa.get());
-	}
-	else
-	{
-		trace("Could not resolve %s.\n", hostnameStr);
-	}
+	netLibrary->ConnectToServer(hostnameStr);
 }
 
 static std::string g_pendingAuthPayload;
@@ -160,7 +160,7 @@ static void HandleAuthPayload(const std::string& payloadStr)
 	{
 		auto payloadJson = nlohmann::json(payloadStr).dump();
 
-		nui::ExecuteRootScript(fmt::sprintf("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'authPayload', data: %s }, '*');", payloadJson));
+		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "authPayload", "data": %s })", payloadJson));
 	}
 	else
 	{
@@ -168,8 +168,34 @@ static void HandleAuthPayload(const std::string& payloadStr)
 	}
 }
 
+#include <LegitimacyAPI.h>
+
+static std::string g_discourseClientId;
+static std::string g_discourseUserToken;
+
+static std::string g_cardConnectionToken;
+
 static InitFunction initFunction([] ()
 {
+	static std::function<void()> g_onYesCallback;
+
+	static ipc::Endpoint ep("launcherTalk", false);
+
+	OnCriticalGameFrame.Connect([]()
+	{
+		ep.RunFrame();
+	});
+
+	OnGameFrame.Connect([]()
+	{
+		ep.RunFrame();
+	});
+
+	Instance<ICoreGameInit>::Get()->OnGameRequestLoad.Connect([]()
+	{
+		ep.Call("loading");
+	});
+
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* lib)
 	{
 		netLibrary = lib;
@@ -186,7 +212,9 @@ static InitFunction initFunction([] ()
 
 			document.Accept(writer);
 
-			nui::ExecuteRootScript(va("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'connectFailed', message: %s }, '*');", sbuffer.GetString()));
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectFailed", "message": %s })", sbuffer.GetString()));
+
+			ep.Call("connectionError", std::string(error));
 		});
 
 		netLibrary->OnConnectionProgress.Connect([] (const std::string& message, int progress, int totalProgress)
@@ -204,27 +232,60 @@ static InitFunction initFunction([] ()
 
 			if (nui::HasMainUI())
 			{
-				nui::ExecuteRootScript(va("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'connectStatus', data: %s }, '*');", sbuffer.GetString()));
+				nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectStatus", "data": %s })", sbuffer.GetString()));
 			}
+
+			ep.Call("connectionProgress", message, progress, totalProgress);
+		});
+
+		netLibrary->OnConnectionCardPresent.Connect([](const std::string& card, const std::string& token)
+		{
+			g_cardConnectionToken = token;
+
+			rapidjson::Document document;
+			document.SetObject();
+			document.AddMember("card", rapidjson::Value(card.c_str(), card.size(), document.GetAllocator()), document.GetAllocator());
+
+			rapidjson::StringBuffer sbuffer;
+			rapidjson::Writer<rapidjson::StringBuffer> writer(sbuffer);
+
+			document.Accept(writer);
+
+			if (nui::HasMainUI())
+			{
+				nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectCard", "data": %s })", sbuffer.GetString()));
+			}
+
+			ep.Call("connectionError", std::string("Cards don't exist here yet!"));
 		});
 
 		static std::function<void()> finishConnectCb;
 		static bool disconnected;
 
-		netLibrary->OnInterceptConnection.Connect([](const net::PeerAddress& peer, const std::function<void()>& cb)
+		netLibrary->OnInterceptConnection.Connect([](const std::string& url, const std::function<void()>& cb)
 		{
-			if (Instance<ICoreGameInit>::Get()->GetGameLoaded() && !disconnected)
+			if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
 			{
-				netLibrary->OnConnectionProgress("Waiting for game to shut down...", 0, 100);
+				if (!disconnected)
+				{
+					netLibrary->OnConnectionProgress("Waiting for game to shut down...", 0, 100);
 
-				finishConnectCb = cb;
+					finishConnectCb = cb;
 
-				return false;
+					return false;
+				}
+			}
+			else
+			{
+				disconnected = false;
 			}
 
-			disconnected = false;
-
 			return true;
+		});
+
+		Instance<ICoreGameInit>::Get()->OnGameFinalizeLoad.Connect([]()
+		{
+			disconnected = false;
 		});
 
 		Instance<ICoreGameInit>::Get()->OnShutdownSession.Connect([]()
@@ -233,14 +294,72 @@ static InitFunction initFunction([] ()
 			{
 				auto cb = std::move(finishConnectCb);
 				cb();
-
-				disconnected = false;
 			}
 			else
 			{
 				disconnected = true;
 			}
 		}, 5000);
+
+		lib->AddReliableHandler("msgPaymentRequest", [](const char* buf, size_t len)
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(std::string(buf, len));
+
+				se::ScopedPrincipal scope(se::Principal{ "system.console" });
+				console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->SetValue("0");
+				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "warningmessage", "PURCHASE REQUEST", fmt::sprintf("The server is requesting a purchase of %s for %s.", json.value("sku_name", ""), json.value("sku_price", "")), "Do you want to purchase this item?", "20" });
+
+				g_onYesCallback = [json]()
+				{
+					std::map<std::string, std::string> postMap;
+					postMap["data"] = json.value<std::string>("data", "");
+					postMap["sig"] = json.value<std::string>("sig", "");
+					postMap["clientId"] = g_discourseClientId;
+					postMap["userToken"] = g_discourseUserToken;
+
+					Instance<HttpClient>::Get()->DoPostRequest("https://keymaster.fivem.net/api/paymentAssign", postMap, [](bool success, const char* data, size_t length)
+					{
+						if (success)
+						{
+							auto res = nlohmann::json::parse(std::string(data, length));
+							auto url = res.value("url", "");
+
+							if (!url.empty())
+							{
+								if (url.find("http://") == 0 || url.find("https://") == 0)
+								{
+									ShellExecute(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+								}
+							}
+						}
+					});
+				};
+			}
+			catch (const std::exception& e)
+			{
+
+			}
+		}, true);
+	});
+
+	OnMainGameFrame.Connect([]()
+	{
+		if (g_onYesCallback)
+		{
+			int result = atoi(console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->GetValue().c_str());
+
+			if (result != 0)
+			{
+				if (result == 4)
+				{
+					g_onYesCallback();
+				}
+
+				g_onYesCallback = {};
+			}
+		}
 	});
 
 	OnKillNetwork.Connect([](const char*)
@@ -253,6 +372,63 @@ static InitFunction initFunction([] ()
 		ConnectTo(server);
 	});
 
+	ep.Bind("connectTo", [](const std::string& url)
+	{
+		ConnectTo(url);
+	});
+
+	ep.Bind("charInput", [](uint32_t ch)
+	{
+		bool p = true;
+		LRESULT r;
+
+		InputHook::DeprecatedOnWndProc(NULL, WM_CHAR, ch, 0, p, r);
+	});
+
+	ep.Bind("imeCommitText", [](const std::string& u8str, int rS, int rE, int p)
+	{
+		auto b = nui::GetBrowser();
+
+		if (b)
+		{
+			b->GetHost()->ImeCommitText(ToWide(u8str), CefRange(rS, rE), p);
+		}
+	});
+
+	ep.Bind("imeSetComposition", [](const std::string& u8str, const std::vector<std::string>& underlines, int rS, int rE, int cS, int cE)
+	{
+		auto b = nui::GetBrowser();
+
+		if (b)
+		{
+			std::vector<CefCompositionUnderline> uls;
+
+			for (auto& ul : underlines)
+			{
+				uls.push_back(*reinterpret_cast<const CefCompositionUnderline*>(ul.c_str()));
+			}
+
+			b->GetHost()->ImeSetComposition(ToWide(u8str), uls, CefRange(rS, rE), CefRange(cS, cE));
+		}
+	});
+
+	ep.Bind("imeCancelComposition", []()
+	{
+		auto b = nui::GetBrowser();
+
+		if (b)
+		{
+			b->GetHost()->ImeCancelComposition();
+		}
+	});
+
+	ep.Bind("resizeWindow", [](int w, int h)
+	{
+		auto wnd = FindWindow(L"grcWindow", NULL);
+
+		SetWindowPos(wnd, NULL, 0, 0, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+	});
+
 	static ConsoleCommand disconnectCommand("disconnect", []()
 	{
 		if (netLibrary->GetConnectionState() != 0)
@@ -261,6 +437,8 @@ static InitFunction initFunction([] ()
 			OnMsgConfirm();
 		}
 	});
+
+	static ConVar<bool> uiPremium("ui_premium", ConVar_None, false);
 	
 	ConHost::OnInvokeNative.Connect([](const char* type, const char* arg)
 	{
@@ -272,7 +450,13 @@ static InitFunction initFunction([] ()
 
 	nui::OnInvokeNative.Connect([](const wchar_t* type, const wchar_t* arg)
 	{
-		if (!_wcsicmp(type, L"connectTo"))
+		if (!_wcsicmp(type, L"getMinModeInfo"))
+		{
+			auto manifest = CoreGetMinModeManifest();
+
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setMinModeInfo", "enabled": %s, "data": %s })", manifest->IsEnabled() ? "true" : "false", manifest->GetRaw()));
+		}
+		else if (!_wcsicmp(type, L"connectTo"))
 		{
 			std::wstring hostnameStrW = arg;
 			std::string hostnameStr(hostnameStrW.begin(), hostnameStrW.end());
@@ -292,7 +476,7 @@ static InitFunction initFunction([] ()
 				if (newusername.c_str() != netLibrary->GetPlayerName()) {
 					netLibrary->SetPlayerName(newusername.c_str());
 					trace(va("Changed player name to %s\n", newusername.c_str()));
-					nui::ExecuteRootScript(va("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'setSettingsNick', nickname: '%s' }, '*');", newusername.c_str()));
+					nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setSettingsNick", "nickname": "%s" })", newusername));
 				}
 			}
 		}
@@ -322,7 +506,7 @@ static InitFunction initFunction([] ()
 
 					document.Accept(writer);
 
-					nui::ExecuteRootScript(fmt::sprintf("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'setWarningMessage', message: %s }, '*');", sbuffer.GetString()));
+					nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setWarningMessage", "message": %s })", sbuffer.GetString()));
 				}
 
 				Instance<ICoreGameInit>::Get()->SetData("warningMessage", "");
@@ -332,7 +516,7 @@ static InitFunction initFunction([] ()
 			DWORD len = _countof(computerName);
 			GetComputerNameW(computerName, &len);
 
-			nui::ExecuteRootScript(va("citFrames[\"mpMenu\"].contentWindow.postMessage({ type: 'setComputerName', data: '%s' }, '*');", ToNarrow(computerName)));
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setComputerName", "data": "%s" })", ToNarrow(computerName)));
 		}
 		else if (!_wcsicmp(type, L"checkNickname"))
 		{
@@ -367,16 +551,101 @@ static InitFunction initFunction([] ()
 				TerminateProcess(GetCurrentProcess(), 0);
 			});
 		}
+#ifdef GTA_FIVE
+		else if (!_wcsicmp(type, L"setDiscourseIdentity"))
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(ToNarrow(arg));
+
+				g_discourseUserToken = json.value<std::string>("token", "");
+				g_discourseClientId = json.value<std::string>("clientId", "");
+
+				Instance<::HttpClient>::Get()->DoPostRequest(
+					"https://lambda.fivem.net/api/validate/discourse",
+					{
+						{ "entitlementId", ros::GetEntitlementSource() },
+						{ "authToken", g_discourseUserToken },
+						{ "clientId", g_discourseClientId },
+					},
+					[](bool success, const char* data, size_t size)
+				{
+					if (success)
+					{
+						std::string response{ data, size };
+
+						bool hasEndUserPremium = false;
+
+						try
+						{
+							auto json = nlohmann::json::parse(response);
+
+							for (const auto& group : json["user"]["groups"])
+							{
+								auto name = group.value<std::string>("name", "");
+
+								if (name == "staff" || name == "patreon_enduser")
+								{
+									hasEndUserPremium = true;
+									break;
+								}
+							}
+						}
+						catch (const std::exception& e)
+						{
+
+						}
+
+						if (hasEndUserPremium)
+						{
+							uiPremium.GetHelper()->SetRawValue(true);
+							Instance<ICoreGameInit>::Get()->SetVariable("endUserPremium");
+						}
+					}
+				});
+			}
+			catch (const std::exception& e)
+			{
+				trace("failed to set discourse identity: %s\n", e.what());
+			}
+		}
+#endif
+		else if (!_wcsicmp(type, L"submitCardResponse"))
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(ToNarrow(arg));
+
+				if (!g_cardConnectionToken.empty())
+				{
+					netLibrary->SubmitCardResponse(json["data"].dump(), g_cardConnectionToken);
+				}
+			}
+			catch (const std::exception& e)
+			{
+				trace("failed to set card response: %s\n", e.what());
+			}
+		}
 	});
 
 	OnGameFrame.Connect([]()
 	{
+		static bool hi;
+
+		if (!hi)
+		{
+			ep.Call("hi");
+			hi = true;
+		}
+
 		se::ScopedPrincipal scope(se::Principal{ "system.console" });
 		Instance<console::Context>::Get()->ExecuteBuffer();
 	});
 
 	OnMsgConfirm.Connect([] ()
 	{
+		ep.Call("disconnected");
+
 		nui::SetMainUI(true);
 
 		nui::CreateFrame("mpMenu", console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("ui_url")->GetValue());
@@ -386,12 +655,13 @@ static InitFunction initFunction([] ()
 #include <gameSkeleton.h>
 #include <shellapi.h>
 
-#include <nng.h>
-#include <protocol/pipeline0/pull.h>
-#include <protocol/pipeline0/push.h>
+#include <nng/nng.h>
+#include <nng/protocol/pipeline0/pull.h>
+#include <nng/protocol/pipeline0/push.h>
 
 static void ProtocolRegister()
 {
+#ifdef GTA_FIVE
 	LSTATUS result;
 
 #define CHECK_STATUS(x) \
@@ -436,6 +706,15 @@ static void ProtocolRegister()
 	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\FiveM.ProtocolHandler\\shell\\open\\command", &key));
 	CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
 	CHECK_STATUS(RegCloseKey(key));
+
+	if (!IsWindows8Point1OrGreater())
+	{
+		// these are for compatibility on downlevel Windows systems
+		CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\fivem\\shell\\open\\command", &key));
+		CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
+		CHECK_STATUS(RegCloseKey(key));
+	}
+#endif
 }
 
 void Component_RunPreInit()
@@ -459,25 +738,24 @@ void Component_RunPreInit()
 
 		if (arg.find("fivem:") == 0)
 		{
-			std::error_code ec;
-			network::uri parsed = network::make_uri(arg, ec);
+			auto parsed = skyr::make_url(arg);
 
-			if (!static_cast<bool>(ec))
+			if (parsed)
 			{
-				if (!parsed.host().empty())
+				if (!parsed->host().empty())
 				{
-					if (parsed.host().to_string() == "connect")
+					if (parsed->host() == "connect")
 					{
-						if (!parsed.path().empty())
+						if (!parsed->pathname().empty())
 						{
-							connectHost = parsed.path().substr(1).to_string();
+							connectHost = parsed->pathname().substr(1);
 						}
 					}
-					else if (parsed.host().to_string() == "accept-auth")
+					else if (parsed->host() == "accept-auth")
 					{
-						if (!parsed.query().empty())
+						if (!parsed->search().empty())
 						{
-							authPayload = parsed.query().to_string();
+							authPayload = parsed->search().substr(1);
 						}
 					}
 				}
@@ -513,7 +791,7 @@ void Component_RunPreInit()
 
 			if (!hostData->gamePid)
 			{
-				AllowSetForegroundWindow(hostData->initialPid);
+				AllowSetForegroundWindow(hostData->GetInitialPid());
 			}
 			else
 			{
@@ -548,7 +826,7 @@ void Component_RunPreInit()
 
 			if (!hostData->gamePid)
 			{
-				AllowSetForegroundWindow(hostData->initialPid);
+				AllowSetForegroundWindow(hostData->GetInitialPid());
 			}
 			else
 			{

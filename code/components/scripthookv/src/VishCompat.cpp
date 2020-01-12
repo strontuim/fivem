@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 #include <scrEngine.h>
+#include <ScriptHandlerMgr.h>
+
 #include "ICoreGameInit.h"
 #include <InputHook.h>
 #include <IteratorView.h>
@@ -112,13 +114,24 @@ private:
 
 	bool m_initedNet;
 
+	bool m_hasScriptHandler;
+
 public:
 	virtual void DoRun() override
 	{
+		if (!m_hasScriptHandler)
+		{
+			CGameScriptHandlerMgr::GetInstance()->AttachScript(this);
+
+			m_hasScriptHandler = true;
+		}
+
 		if (!m_initedNet)
 		{
 			// make this a network script
 			NativeInvoke::Invoke<0x1CA59E306ECB80A5, int>(32, false, -1);
+
+			m_initedNet = true;
 		}
 
 		std::vector<std::shared_ptr<FishScript>> thisIterScripts(m_scripts);
@@ -128,6 +141,8 @@ public:
 			script->Tick();
 		}
 	}
+
+	virtual void Kill() override;
 
 	virtual rage::eThreadState Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount) override;
 
@@ -159,6 +174,11 @@ rage::eThreadState FishThread::Reset(uint32_t scriptHash, void* pArgs, uint32_t 
 	}
 
 	return GtaThread::Reset(scriptHash, pArgs, argCount);
+}
+
+void FishThread::Kill()
+{
+	m_hasScriptHandler = false;
 }
 
 void FishThread::AddScript(void(*fn)())
@@ -334,6 +354,15 @@ DLL_EXPORT uint64_t* nativeCall()
 		valid = MpGamerTagCheck();
 	}
 
+	if (valid)
+	{
+		if (!CfxIsSinglePlayer())
+		{
+			if (!Instance<ICoreGameInit>::Get()->ShAllowed) valid = false;
+			if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited")) valid = false;
+		}
+	}
+
 	if (fn != 0 && valid)
 	{
 		void* returnAddress = _ReturnAddress();
@@ -398,14 +427,43 @@ int DLL_EXPORT worldGetAllObjects(int* array, int arraySize)
 	return 0;
 }
 
-static InitFunction initFunction([] ()
+static InitFunction initFunction([]()
 {
-	rage::scrEngine::OnScriptInit.Connect([] ()
+	rage::scrEngine::OnScriptInit.Connect([]()
 	{
 		rage::scrEngine::CreateThread(&g_fish);
 	});
 
-	InputHook::OnWndProc.Connect([] (HWND, UINT wMsg, WPARAM wParam, LPARAM lParam, bool&, LRESULT& result)
+	InputHook::QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
+	{
+		static struct : InputTarget
+		{
+			virtual inline void KeyDown(UINT vKey, UINT scanCode) override
+			{
+				auto functions = g_keyboardFunctions;
+
+				for (auto& function : functions)
+				{
+					function(vKey, 0, 0, FALSE, FALSE, FALSE, FALSE);
+				}
+			}
+
+			virtual inline void KeyUp(UINT vKey, UINT scanCode) override
+			{
+				auto functions = g_keyboardFunctions;
+
+				for (auto& function : functions)
+				{
+					function(vKey, 0, 0, FALSE, FALSE, FALSE, TRUE);
+				}
+			}
+
+		} tgt;
+
+		targets.push_back(&tgt);
+	});
+
+	InputHook::DeprecatedOnWndProc.Connect([] (HWND, UINT wMsg, WPARAM wParam, LPARAM lParam, bool&, LRESULT& result)
 	{
 		if (wMsg == WM_KEYDOWN || wMsg == WM_KEYUP || wMsg == WM_SYSKEYDOWN || wMsg == WM_SYSKEYUP)
 		{

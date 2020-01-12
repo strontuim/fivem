@@ -66,6 +66,8 @@ bool_t bPreferAlpha;
 extern int* udpsocks;
 extern bool_t hasv4;
 
+std::recursive_mutex g_mumbleClientMutex;
+
 void Client_init()
 {
 	maxBandwidth = getIntConf(MAX_BANDWIDTH) / 8; /* From bits/s -> bytes/s */
@@ -95,6 +97,8 @@ int Client_getfds(struct pollfd *pollfds)
 
 void Client_janitor()
 {
+	std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+
 	struct dlist *itr, *save;
 	int bwTop = maxBandwidth + maxBandwidth / 4;
 	list_iterate_safe(itr, save, &clients) {
@@ -985,7 +989,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 		}
 		/* Sessions */
 		for (i = 0; i < TARGET_MAX_SESSIONS && vt->sessions[i] != -1; i++) {
-			client_t *c;
+			client_t *c = NULL;
 			buffer[0] = (uint8_t) (type | 2);
 			Log_debug("Whisper session %d", vt->sessions[i]);
 			while (Client_iterate(&c) != NULL) {

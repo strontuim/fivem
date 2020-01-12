@@ -11,6 +11,7 @@ import { ServersService } from '../servers.service';
 import { GameService, ServerHistoryEntry } from '../../game.service';
 
 import { DomSanitizer } from '@angular/platform-browser';
+import { Language } from 'angular-l10n';
 
 class ServerHistoryData {
     entry: ServerHistoryEntry;
@@ -31,6 +32,9 @@ export class DirectConnectComponent implements OnInit, AfterViewInit {
     server: Server;
     error = '';
     inputInvalid = false;
+
+    @Language()
+    lang: string;
 
     onFetchCB: () => void;
 
@@ -114,7 +118,7 @@ export class DirectConnectComponent implements OnInit, AfterViewInit {
 
     parseAddress(addr: string): [string, number] {
         const addrBits: [string, number] = [ '', 30120 ];
-        const match = addr.match(/^((?:[^\[: ]+)|\[(?:[a-f0-9:]+)\])(?::([0-9]+)|$)/i);
+        const match = addr.match(/^(?:((?:[^\[: ]+)|\[(?:[a-f0-9:]+)\])(?::([0-9]+)|$)|cfx\.re\/join\/[0-9a-z]+)/i);
 
         if (!match) {
             return null;

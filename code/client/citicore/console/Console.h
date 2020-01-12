@@ -71,6 +71,8 @@ public:
 
 	virtual void SetVariableModifiedFlags(int flags);
 
+	virtual bool GIsPrinting();
+
 	virtual ConsoleCommandManager* GetCommandManager();
 
 	virtual ConsoleVariableManager* GetVariableManager();
@@ -83,8 +85,11 @@ public:
 	inline bool IsBufferEmpty()
 	{
 		std::lock_guard<std::mutex> guard(m_commandBufferMutex);
-		return m_commandBuffer.empty();
+		return m_commandBuffer.empty() && !m_executing;
 	}
+
+public:
+	fwEvent<const std::function<void(const std::string&)>&> OnSaveConfiguration;
 
 private:
 	Context* m_fallbackContext;
@@ -96,6 +101,8 @@ private:
 	std::string m_commandBuffer;
 
 	std::mutex m_commandBufferMutex;
+
+	volatile bool m_executing;
 };
 
 #ifdef COMPILING_CORE

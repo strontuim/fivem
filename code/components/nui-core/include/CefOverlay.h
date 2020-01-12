@@ -13,13 +13,18 @@
 #define OVERLAY_DECL __declspec(dllimport)
 #endif
 
+#include <d3d11.h>
+
 #include <memory>
 
-#include "grcTexture.h"
+#include "RGBA.h"
+#include "Rect.h"
 
 #include <include/cef_app.h>
 #include <include/cef_browser.h>
 #include <include/cef_client.h>
+
+#include <SharedInput.h>
 
 #include <queue>
 
@@ -44,6 +49,232 @@ private:
 
 namespace nui
 {
+	struct GILockedTexture
+	{
+		int level;
+		void* pBits;
+		int pitch;
+		int width;
+		int height;
+		int format;
+		int numSubLevels;
+	};
+
+	enum class GILockFlags : int
+	{
+		Read = 1,
+		Write = 2,
+		Unknown = 4,
+		WriteDiscard = 8,
+		NoOverwrite = 16
+	};
+
+	class OVERLAY_DECL GITexture
+	{
+	public:
+		virtual ~GITexture() = default;
+
+		virtual void* GetNativeTexture() = 0;
+
+		virtual void* GetHostTexture() = 0;
+
+		virtual bool Map(int numSubLevels, int subLevel, GILockedTexture* lockedTexture, GILockFlags flags) = 0;
+
+		virtual void Unmap(GILockedTexture* lockedTexture) = 0;
+	};
+
+	enum class GITextureFormat
+	{
+		ARGB
+	};
+
+	struct ResultingRectangle
+	{
+		CRect rectangle;
+		CRGBA color;
+	};
+
+	class OVERLAY_DECL GameInterface
+	{
+	public:
+		virtual void GetGameResolution(int* width, int* height) = 0;
+
+		virtual GITexture* CreateTexture(int width, int height, GITextureFormat format, void* pixelData) = 0;
+
+		virtual GITexture* CreateTextureBacking(int width, int height, GITextureFormat format) = 0;
+
+		virtual GITexture* CreateTextureFromShareHandle(HANDLE shareHandle) = 0;
+
+		virtual GITexture* CreateTextureFromShareHandle(HANDLE shareHandle, int width, int height)
+		{
+			return CreateTextureFromShareHandle(shareHandle);
+		}
+
+		virtual void SetTexture(GITexture* texture, bool pm = false) = 0;
+
+		virtual void DrawRectangles(int numRectangles, const ResultingRectangle* rectangles) = 0;
+
+		virtual void UnsetTexture() = 0;
+
+		virtual void SetGameMouseFocus(bool val) = 0;
+
+		virtual HWND GetHWND() = 0;
+
+		virtual void BlitTexture(GITexture* dst, GITexture* src) = 0;
+
+		virtual ID3D11Device* GetD3D11Device() = 0;
+
+		virtual ID3D11DeviceContext* GetD3D11DeviceContext() = 0;
+
+		virtual GITexture* CreateTextureFromD3D11Texture(ID3D11Texture2D* texture) = 0;
+
+		fwEvent<HWND, UINT, WPARAM, LPARAM, bool&, LRESULT&> OnWndProc;
+
+		fwEvent<std::vector<InputTarget*>&> QueryInputTarget;
+
+		fwEvent<int&> QueryMayLockCursor;
+
+		fwEvent<> OnInitVfs;
+
+		fwEvent<> OnInitRenderer;
+
+		fwEvent<> OnRender;
+	};
+
+	void OVERLAY_DECL Initialize(nui::GameInterface* gi);
+
+	enum class CefChannelLayout
+	{
+		CEF_CHANNEL_LAYOUT_NONE = 0,
+		CEF_CHANNEL_LAYOUT_UNSUPPORTED = 1,
+
+		// Front C
+		CEF_CHANNEL_LAYOUT_MONO = 2,
+
+		// Front L, Front R
+		CEF_CHANNEL_LAYOUT_STEREO = 3,
+
+		// Front L, Front R, Back C
+		CEF_CHANNEL_LAYOUT_2_1 = 4,
+
+		// Front L, Front R, Front C
+		CEF_CHANNEL_LAYOUT_SURROUND = 5,
+
+		// Front L, Front R, Front C, Back C
+		CEF_CHANNEL_LAYOUT_4_0 = 6,
+
+		// Front L, Front R, Side L, Side R
+		CEF_CHANNEL_LAYOUT_2_2 = 7,
+
+		// Front L, Front R, Back L, Back R
+		CEF_CHANNEL_LAYOUT_QUAD = 8,
+
+		// Front L, Front R, Front C, Side L, Side R
+		CEF_CHANNEL_LAYOUT_5_0 = 9,
+
+		// Front L, Front R, Front C, LFE, Side L, Side R
+		CEF_CHANNEL_LAYOUT_5_1 = 10,
+
+		// Front L, Front R, Front C, Back L, Back R
+		CEF_CHANNEL_LAYOUT_5_0_BACK = 11,
+
+		// Front L, Front R, Front C, LFE, Back L, Back R
+		CEF_CHANNEL_LAYOUT_5_1_BACK = 12,
+
+		// Front L, Front R, Front C, Side L, Side R, Back L, Back R
+		CEF_CHANNEL_LAYOUT_7_0 = 13,
+
+		// Front L, Front R, Front C, LFE, Side L, Side R, Back L, Back R
+		CEF_CHANNEL_LAYOUT_7_1 = 14,
+
+		// Front L, Front R, Front C, LFE, Side L, Side R, Front LofC, Front RofC
+		CEF_CHANNEL_LAYOUT_7_1_WIDE = 15,
+
+		// Stereo L, Stereo R
+		CEF_CHANNEL_LAYOUT_STEREO_DOWNMIX = 16,
+
+		// Stereo L, Stereo R, LFE
+		CEF_CHANNEL_LAYOUT_2POINT1 = 17,
+
+		// Stereo L, Stereo R, Front C, LFE
+		CEF_CHANNEL_LAYOUT_3_1 = 18,
+
+		// Stereo L, Stereo R, Front C, Rear C, LFE
+		CEF_CHANNEL_LAYOUT_4_1 = 19,
+
+		// Stereo L, Stereo R, Front C, Side L, Side R, Back C
+		CEF_CHANNEL_LAYOUT_6_0 = 20,
+
+		// Stereo L, Stereo R, Side L, Side R, Front LofC, Front RofC
+		CEF_CHANNEL_LAYOUT_6_0_FRONT = 21,
+
+		// Stereo L, Stereo R, Front C, Rear L, Rear R, Rear C
+		CEF_CHANNEL_LAYOUT_HEXAGONAL = 22,
+
+		// Stereo L, Stereo R, Front C, LFE, Side L, Side R, Rear Center
+		CEF_CHANNEL_LAYOUT_6_1 = 23,
+
+		// Stereo L, Stereo R, Front C, LFE, Back L, Back R, Rear Center
+		CEF_CHANNEL_LAYOUT_6_1_BACK = 24,
+
+		// Stereo L, Stereo R, Side L, Side R, Front LofC, Front RofC, LFE
+		CEF_CHANNEL_LAYOUT_6_1_FRONT = 25,
+
+		// Front L, Front R, Front C, Side L, Side R, Front LofC, Front RofC
+		CEF_CHANNEL_LAYOUT_7_0_FRONT = 26,
+
+		// Front L, Front R, Front C, LFE, Back L, Back R, Front LofC, Front RofC
+		CEF_CHANNEL_LAYOUT_7_1_WIDE_BACK = 27,
+
+		// Front L, Front R, Front C, Side L, Side R, Rear L, Back R, Back C.
+		CEF_CHANNEL_LAYOUT_OCTAGONAL = 28,
+
+		// Channels are not explicitly mapped to speakers.
+		CEF_CHANNEL_LAYOUT_DISCRETE = 29,
+
+		// Front L, Front R, Front C. Front C contains the keyboard mic audio. This
+		// layout is only intended for input for WebRTC. The Front C channel
+		// is stripped away in the WebRTC audio input pipeline and never seen outside
+		// of that.
+		CEF_CHANNEL_LAYOUT_STEREO_AND_KEYBOARD_MIC = 30,
+
+		// Front L, Front R, Side L, Side R, LFE
+		CEF_CHANNEL_LAYOUT_4_1_QUAD_SIDE = 31,
+
+		// Actual channel layout is specified in the bitstream and the actual channel
+		// count is unknown at Chromium media pipeline level (useful for audio
+		// pass-through mode).
+		CEF_CHANNEL_LAYOUT_BITSTREAM = 32,
+
+		// Max value, must always equal the largest entry ever logged.
+		CEF_CHANNEL_LAYOUT_MAX = CEF_CHANNEL_LAYOUT_BITSTREAM
+	};
+
+	struct AudioStreamParams
+	{
+		int channels;
+		CefChannelLayout channelLayout;
+		int sampleRate;
+		int framesPerBuffer;
+
+		std::string frameName;
+		std::string categoryName;
+	};
+
+	class IAudioStream
+	{
+	public:
+		virtual ~IAudioStream() = default;
+
+		virtual void ProcessPacket(const float** data, int frames, int64 pts) = 0;
+	};
+
+	class IAudioSink
+	{
+	public:
+		virtual std::shared_ptr<IAudioStream> CreateAudioStream(const AudioStreamParams& params) = 0;
+	};
+
 	//void EnterV8Context(const char* type);
 	//void LeaveV8Context(const char* type);
 	//void InvokeNUICallback(const char* type, const CefString& name, const CefV8ValueList& arguments);
@@ -56,6 +287,7 @@ namespace nui
 
 	void OVERLAY_DECL GiveFocus(bool hasFocus, bool hasCursor = false);
 	void OVERLAY_DECL OverrideFocus(bool hasFocus);
+	void OVERLAY_DECL KeepInput(bool keepInput);
 	bool OVERLAY_DECL HasMainUI();
 	void OVERLAY_DECL SetMainUI(bool enable);
 
@@ -63,9 +295,11 @@ namespace nui
 
 	void OVERLAY_DECL ExecuteRootScript(const std::string& scriptBit);
 
-	OVERLAY_DECL CefBrowser* GetBrowser();
+	void OVERLAY_DECL PostFrameMessage(const std::string& frameName, const std::string& jsonData);
 
-	bool OnPreLoadGame(void* cefSandbox);
+	void OVERLAY_DECL PostRootMessage(const std::string& jsonData);
+
+	OVERLAY_DECL CefBrowser* GetBrowser();
 
 	// window API
 	OVERLAY_DECL CefBrowser* GetNUIWindowBrowser(fwString windowName);
@@ -75,7 +309,7 @@ namespace nui
 	OVERLAY_DECL void ExecuteWindowScript(const std::string& windowName, const std::string& scriptBit);
 	OVERLAY_DECL void SetNUIWindowURL(fwString windowName, fwString url);
 
-	OVERLAY_DECL rage::grcTexture* GetWindowTexture(fwString windowName);
+	OVERLAY_DECL GITexture* GetWindowTexture(fwString windowName);
 
 	extern
 		OVERLAY_DECL
@@ -84,6 +318,8 @@ namespace nui
 	extern
 		OVERLAY_DECL
 		fwEvent<bool> OnDrawBackground;
+
+	OVERLAY_DECL void SetAudioSink(IAudioSink* sinkRef);
 }
 
 #define REQUIRE_IO_THREAD()   assert(CefCurrentlyOn(TID_IO));

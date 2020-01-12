@@ -1,4 +1,4 @@
-import { Injectable, NgZone } from '@angular/core';
+import { Injectable, NgZone, Inject, PLATFORM_ID } from '@angular/core';
 import { Http, ResponseContentType } from '@angular/http';
 import { HttpClient } from '@angular/common/http';
 import { DomSanitizer } from '@angular/platform-browser';
@@ -20,11 +20,29 @@ import 'rxjs/add/operator/map';
 
 import ReconnectingWebSocket from 'reconnecting-websocket';
 
-import { Server, ServerIcon, PinConfig } from './server';
+import { Server } from './server';
+import { PinConfig } from './pins';
 
 import { master } from './master';
+import { isPlatformBrowser } from '@angular/common';
+import { GameService } from '../game.service';
+import { FilterRequest } from './filter-request';
 
-const serverWorker = require('file-loader?name=worker.[hash:20].[ext]!../../worker/index.js');
+const myWorker = new Worker('./servers.worker', { type: 'module' });
+
+class ServerCacheEntry {
+    public server: Server;
+    public lastTime: Date;
+
+    public constructor(server: Server) {
+        this.lastTime = new Date();
+        this.server = server;
+    }
+
+    public isValid() {
+        return (new Date().getTime() - this.lastTime.getTime()) < 15000;
+    }
+}
 
 @Injectable()
 export class ServersService {
@@ -39,23 +57,46 @@ export class ServersService {
 
     private servers: {[ addr: string ]: Server} = {};
 
-    constructor(private http: Http, private httpClient: HttpClient, private domSanitizer: DomSanitizer, private zone: NgZone) {
+    private serverCache: { [addr: string]: ServerCacheEntry } = {};
+
+    private onSortCB: ((servers: string[]) => void)[] = [];
+
+    // rawServers is a list of raw servers used for sharing between ServersContainer
+    // and ServersList
+    public rawServers: { [addr: string]: Server } = {};
+
+    constructor(private httpClient: HttpClient, private domSanitizer: DomSanitizer, private zone: NgZone,
+        private gameService: GameService, @Inject(PLATFORM_ID) private platformId: any) {
         this.requestEvent = new Subject<string>();
 
         this.serversEvent = new Subject<Server>();
         this.internalServerEvent = new Subject<master.IServer>();
 
         // only enable the worker if streams are supported
-        if (Response !== undefined && Response.prototype.hasOwnProperty('body')) {
-            this.worker = new Worker(serverWorker);
+        if (typeof window !== 'undefined' && window.hasOwnProperty('Response') && Response.prototype.hasOwnProperty('body')) {
+            this.worker = myWorker;
             zone.runOutsideAngular(() => {
                 this.worker.addEventListener('message', (event) => {
                     if (event.data.type === 'addServers') {
                         for (const server of event.data.servers) {
-                            this.internalServerEvent.next(server);
+                            if (this.matchesGame(server)) {
+                                this.internalServerEvent.next(server);
+                            }
                         }
                     } else if (event.data.type === 'serversDone') {
                         this.internalServerEvent.next(null);
+                    } else if (event.data.type === 'sortedServers') {
+                        if (this.onSortCB.length) {
+                            zone.run(() => {
+                                this.onSortCB[0](event.data.servers);
+                                this.onSortCB.shift();
+                            });
+                        }
+                    } else if (event.data.type === 'pushBitmap') {
+                        const addr: string = event.data.server;
+                        const bitmap: ImageBitmap = event.data.bitmap;
+
+                        this.rawServers[addr].bitmap = bitmap;
                     }
                 });
             });
@@ -64,6 +105,13 @@ export class ServersService {
                 .subscribe(url => {
                     this.worker.postMessage({ type: 'queryServers', url: url + 'stream/' });
                 });
+
+            const canvas = new OffscreenCanvas(2560, 40);
+
+            this.worker.postMessage({
+                type: 'setCanvas',
+                canvas
+            }, [ canvas ]);
 
             this.subscribeWebSocket();
         }
@@ -81,11 +129,13 @@ export class ServersService {
                 this.serversEvent.next(server);
             });
 
-        this.refreshServers();
+        if (isPlatformBrowser(this.platformId)) {
+            this.refreshServers();
+        }
     }
 
     private get serversSource(): Observable<master.IServer> {
-        if (Response !== undefined && Response.prototype.hasOwnProperty('body')) {
+        if (typeof window !== 'undefined' && window.hasOwnProperty('Response') && Response.prototype.hasOwnProperty('body')) {
             return this.fetchSource;
         } else {
             return this.httpSource;
@@ -103,6 +153,38 @@ export class ServersService {
             .mergeMap(result => master.Servers.decode(new Uint8Array(result)).servers);
     }
 
+    private matchesGame(server: master.IServer) {
+        const serverGame = (server && server.Data && server.Data.vars && server.Data.vars.gamename) ?
+            server.Data.vars.gamename :
+            '';
+
+        const localGame = this.gameService.gameName;
+
+        if (serverGame === localGame) {
+            return true;
+        } else if (serverGame === '' && localGame === 'gta5') {
+            return true;
+        }
+
+        return false;
+    }
+
+    public sortAndFilter(filterRequest: FilterRequest, cb: (servers: string[]) => void) {
+        // don't try to sort when we're already trying
+        if (this.onSortCB.length > 0 && !filterRequest.fromInteraction) {
+            return false;
+        }
+
+        this.onSortCB.push(cb);
+
+        this.worker.postMessage({
+            type: 'sort',
+            data: filterRequest
+        });
+
+        return true;
+    }
+
     private subscribeWebSocket() {
         const ws = new ReconnectingWebSocket('wss://servers-live.fivem.net/api/servers/socket/v1/');
         ws.addEventListener('message', (ev) => {
@@ -110,10 +192,14 @@ export class ServersService {
 
             switch (data.op) {
                 case 'ADD_SERVER':
-                    this.internalServerEvent.next({
+                    const server = {
                         Data: data.data.data,
                         EndPoint: data.id
-                    });
+                    };
+
+                    if (this.matchesGame(server)) {
+                        this.internalServerEvent.next(server);
+                    }
                 break;
                 case 'UPDATE_SERVER':
                     const old = this.servers[data.id];
@@ -144,10 +230,18 @@ export class ServersService {
         this.requestEvent.next('https://servers-live.fivem.net/api/servers/');
     }
 
-    public getServer(address: string): Promise<Server> {
-        return fetch('https://servers-live.fivem.net/api/servers/single/' + address)
-            .then(resp => resp.json())
-            .then(data => Server.fromObject(this.domSanitizer, data.EndPoint, data.Data));
+    public async getServer(address: string, force?: boolean): Promise<Server> {
+        if (this.serverCache[address] && this.serverCache[address].isValid() && !force) {
+            return this.serverCache[address].server;
+        }
+
+        const server = await this.httpClient.get('https://servers-frontend.fivem.net/api/servers/single/' + address)
+            .toPromise()
+            .then((data: master.IServer) => Server.fromObject(this.domSanitizer, data.EndPoint, data.Data));
+
+        this.serverCache[address] = new ServerCacheEntry(server);
+
+        return server;
     }
 
     public getServers(): Observable<Server> {
@@ -166,8 +260,8 @@ export class ServersService {
     }
 
     public loadPinConfig(): Promise<PinConfig> {
-        return this.http.get('https://runtime.fivem.net/pins.json')
+        return this.httpClient.get('https://runtime.fivem.net/pins.json')
             .toPromise()
-            .then(result => <PinConfig>result.json());
+            .then((result: PinConfig) => result);
     }
 }

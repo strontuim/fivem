@@ -1,6 +1,15 @@
 @import "variables";
 
 @import "~balloon-css/balloon.css";
+@import "~flag-icon-css/css/flag-icon.css";
+
+.flag-icon-001 {
+	background-image: url(../assets/images/001.svg);
+}
+
+.flag-icon-150 {
+	background-image: url(../assets/images/150.svg);
+}
 
 @font-face
 {
@@ -20,12 +29,16 @@
 	src: url(../assets/fonts/roboto_medium.woff);
 	font-weight: bold;
 }
+@font-face
+{
+	font-family: 'Inter';
+	src: url(../assets/fonts/inter.var.woff2);
+}
 
 * {
 	box-sizing: border-box;
 	padding: 0;
 	margin: 0;
-	font-family: $fonts;
 	user-select: none;
 }
 
@@ -39,37 +52,30 @@ body {
 
 	overflow: hidden;
 
-	color: $fgColour;
-
+	font-family: $fonts;
 	font-size: $fontSize;
+
+	background-color: #000;
 }
 
 $blurSize: 20px;
-
-#bg {
-	z-index: 1;
-
-	position: fixed;
-	top: -($blurSize*2);
-	left: -($blurSize*2);
-	bottom: -($blurSize*2);
-	right: -($blurSize*2);
-
-	transform: translate3d(0, 0, 0);
-
-	background:
-		url(../assets/images/bg.jpg) center center/cover no-repeat;
-}
 
 /* disable chromeme scrollbar */
 .gameapp ::-webkit-scrollbar { width: 0 }
 
 input[type="text"],
 input[type="search"] {
-	background-color: rgba($bgColour, .2);
+	@include themeNoHost() using ($theme) {	
+		background-color: rgba(gtv($theme, bgColour), .2);
+	};
+
 	border: none;
 	border-radius: 1px;
-	color: $fgColour;
+
+	@include themeNoHost() using ($theme) {
+		color: gtv($theme, fgColour);
+	};
+
 	font-size: 1.3rem;
 	font-weight: 100;
 	padding: $padding $padding*$multiplier;
@@ -78,15 +84,21 @@ input[type="search"] {
 
 	&:focus {
 		outline: none;
-		box-shadow: 0 0 0 3px $greenyColour inset;
+		@include themeNoHost() using ($theme) {
+			box-shadow: 0 0 0 3px gtv($theme, greenyColour) inset;
+		};
 	}
 	&:hover,
 	&:focus {
-		background: rgba($bgColour, .2);
+		@include themeNoHost() using ($theme) {
+			background: rgba(gtv($theme, bgColour), .2);
+		};
 	}
 
 	&::-webkit-input-placeholder {
-		color: rgba($textColour, .6);
+		@include themeNoHost() using ($theme) {
+			color: rgba(gtv($theme, textColour), .6);
+		};
 	}
 }
 
@@ -96,9 +108,11 @@ button {
 	border-radius: 2px;
 	border: none;
 
-	color: $fgColour;
-	text-shadow: 0 0 2px rgba($bgColour, .8);
-	background: darken($greenyColour, 10%);
+	@include themeNoHost() using ($theme) {
+		color: gtv($theme, fgColour);
+		text-shadow: 0 0 2px rgba(gtv($theme, bgColour), .8);
+		background: darken(gtv($theme, greenyColour), 10%);
+	};
 
 	font-size: 1.03rem;
 	font-weight: 100;
@@ -108,17 +122,21 @@ button {
 	outline: none;
 
 	&:hover {
-		background: $greenyColour;
-		box-shadow: 0 5px 25px darken($greenyColour, 10%);
+		@include themeNoHost() using ($theme) {
+			background: gtv($theme, greenyColour);
+			box-shadow: 0 5px 25px darken(gtv($theme, greenyColour), 10%);
+		};
 	}
 
 	&.unimportant {
-		background: $bgColour;
+		@include themeNoHost() using ($theme) {
+			background: lighten(gtv($theme, bgColour), 15%);
 
-		&:hover {
-			background: lighten($bgColour, 10%);
-			box-shadow: 0 5px 25px lighten($bgColour, 10%);
-		}
+			&:hover {
+				background: lighten(gtv($theme, bgColour), 25%);
+				box-shadow: 0 5px 25px lighten(gtv($theme, bgColour), 25%);
+			}
+		};
 	}
 }
 
@@ -138,6 +156,19 @@ button {
 		}
 
 		margin-top: 3px;
+	}
+}
+
+.ac-adaptiveCard {
+	padding: 0px !important;
+
+	&:focus {
+		outline: none;
+	}
+
+	.ac-image {
+		max-width: 10vw !important;
+		max-height: initial !important;
 	}
 }
 

@@ -22,6 +22,8 @@ bool g_mainUIFlag = true;
 fwEvent<const wchar_t*, const wchar_t*> nui::OnInvokeNative;
 fwEvent<bool> nui::OnDrawBackground;
 
+extern bool g_shouldCreateRootWindow;
+
 namespace nui
 {
 	__declspec(dllexport) CefBrowser* GetBrowser()
@@ -51,6 +53,40 @@ namespace nui
 		}
 	}
 
+	static void PostJSEvent(const std::string& type, const std::vector<std::reference_wrapper<const std::string>>& args)
+	{
+		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
+
+		if (rootWindow.GetRef() && rootWindow->GetBrowser() && rootWindow->GetBrowser()->GetMainFrame())
+		{
+			auto processMessage = CefProcessMessage::Create("pushEvent");
+			auto argumentList = processMessage->GetArgumentList();
+
+			argumentList->SetString(0, type);
+
+			int argIdx = 1;
+
+			for (auto arg : args)
+			{
+				argumentList->SetString(argIdx, arg.get());
+
+				argIdx++;
+			}
+
+			rootWindow->GetBrowser()->SendProcessMessage(PID_RENDERER, processMessage);
+		}
+	}
+
+	__declspec(dllexport) void PostRootMessage(const std::string& jsonData)
+	{
+		PostJSEvent("rootCall", { jsonData });
+	}
+
+	__declspec(dllexport) void PostFrameMessage(const std::string& frame, const std::string& jsonData)
+	{
+		PostJSEvent("frameCall", { frame, jsonData });
+	}
+
 	__declspec(dllexport) void ReloadNUI()
 	{
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
@@ -71,8 +107,6 @@ namespace nui
 	{
 		auto window = NUIWindow::Create(false, width, height, windowURL);
 
-		Instance<NUIWindowManager>::Get()->AddWindow(window.GetRef());
-
 		std::unique_lock<std::shared_mutex> lock(windowListMutex);
 		windowList[windowName] = window;
 	}
@@ -80,7 +114,15 @@ namespace nui
 	__declspec(dllexport) void DestroyNUIWindow(fwString windowName)
 	{
 		std::unique_lock<std::shared_mutex> lock(windowListMutex);
-		windowList.erase(windowName);
+
+		auto windowIt = windowList.find(windowName);
+
+		if (windowIt != windowList.end())
+		{
+			Instance<NUIWindowManager>::Get()->RemoveWindow(windowIt->second.GetRef());
+
+			windowList.erase(windowName);
+		}
 	}
 
 	static fwRefContainer<NUIWindow> FindNUIWindow(fwString windowName)
@@ -125,7 +167,7 @@ namespace nui
 		}
 	}
 
-	OVERLAY_DECL rage::grcTexture* GetWindowTexture(fwString windowName)
+	OVERLAY_DECL nui::GITexture* GetWindowTexture(fwString windowName)
 	{
 		fwRefContainer<NUIWindow> window = FindNUIWindow(windowName);
 
@@ -152,24 +194,45 @@ namespace nui
 		}
 	}
 
-	static std::unordered_set<std::string> frameList;
+	static std::unordered_map<std::string, std::string> frameList;
 	static std::shared_mutex frameListMutex;
+
+	static bool rootWindowTerminated;
 
 	__declspec(dllexport) void CreateFrame(fwString frameName, fwString frameURL)
 	{
-		auto procMessage = CefProcessMessage::Create("createFrame");
-		auto argumentList = procMessage->GetArgumentList();
+#ifdef IS_LAUNCHER
+		if (rootWindowTerminated)
+		{
+			g_shouldCreateRootWindow = true;
+			rootWindowTerminated = false;
+			return;
+		}
+#endif
 
-		argumentList->SetSize(2);
-		argumentList->SetString(0, frameName.c_str());
-		argumentList->SetString(1, frameURL.c_str());
+		bool exists = false;
 
-		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
-		auto browser = rootWindow->GetBrowser();
-		browser->SendProcessMessage(PID_RENDERER, procMessage);
+		{
+			std::shared_lock<std::shared_mutex> lock(frameListMutex);
+			exists = frameList.find(frameName) != frameList.end();
+		}
 
-		std::unique_lock<std::shared_mutex> lock(frameListMutex);
-		frameList.insert(frameName);
+		if (!exists)
+		{
+			auto procMessage = CefProcessMessage::Create("createFrame");
+			auto argumentList = procMessage->GetArgumentList();
+
+			argumentList->SetSize(2);
+			argumentList->SetString(0, frameName.c_str());
+			argumentList->SetString(1, frameURL.c_str());
+
+			auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
+			auto browser = rootWindow->GetBrowser();
+			browser->SendProcessMessage(PID_RENDERER, procMessage);
+
+			std::unique_lock<std::shared_mutex> lock(frameListMutex);
+			frameList.insert({ frameName, frameURL });
+		}
 	}
 
 	__declspec(dllexport) void DestroyFrame(fwString frameName)
@@ -181,17 +244,56 @@ namespace nui
 		argumentList->SetString(0, frameName.c_str());
 
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
-		auto browser = rootWindow->GetBrowser();
-		browser->SendProcessMessage(PID_RENDERER, procMessage);
 
-		std::unique_lock<std::shared_mutex> lock(frameListMutex);
-		frameList.erase(frameName);
+		if (rootWindow.GetRef())
+		{
+			auto browser = rootWindow->GetBrowser();
+			browser->SendProcessMessage(PID_RENDERER, procMessage);
+
+			std::unique_lock<std::shared_mutex> lock(frameListMutex);
+			frameList.erase(frameName);
+
+#ifdef IS_LAUNCHER
+			if (frameList.empty())
+			{
+				rootWindowTerminated = true;
+
+				browser->GetHost()->CloseBrowser(true);
+				Instance<NUIWindowManager>::Get()->RemoveWindow(rootWindow.GetRef());
+				Instance<NUIWindowManager>::Get()->SetRootWindow({});
+			}
+#endif
+		}
 	}
 
 	bool HasFrame(const std::string& frameName)
 	{
 		std::shared_lock<std::shared_mutex> lock(frameListMutex);
 		return frameList.find(frameName) != frameList.end();
+	}
+
+	void RecreateFrames()
+	{
+		std::vector<std::pair<std::string, std::string>> frameData;
+
+		{
+			std::shared_lock<std::shared_mutex> lock(frameListMutex);
+
+			for (auto& frame : frameList)
+			{
+				frameData.push_back(frame);
+			}
+		}
+
+		{
+			std::unique_lock<std::shared_mutex> lock(frameListMutex);
+			frameList.clear();
+		}
+
+		for (auto& frame : frameData)
+		{
+			CreateFrame(frame.first, frame.second);
+		}
 	}
 
 	__declspec(dllexport) void SignalPoll(fwString frameName)

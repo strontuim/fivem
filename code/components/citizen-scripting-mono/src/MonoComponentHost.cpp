@@ -8,7 +8,11 @@
 #include "StdInc.h"
 #include <om/OMComponent.h>
 
+#include <Resource.h>
+
 #include <fxScripting.h>
+
+#include <CoreConsole.h>
 
 #include <Error.h>
 
@@ -17,10 +21,34 @@
 #include <mono/metadata/assembly.h>
 #include <mono/metadata/debug-helpers.h>
 #include <mono/metadata/threads.h>
+
+extern "C" {
+	void mono_thread_push_appdomain_ref(MonoDomain *domain);
+	void mono_thread_pop_appdomain_ref(void);
+
+	char*
+		mono_method_get_full_name(MonoMethod* method);
+
+	MONO_API MonoArray* mono_get_current_context(void* stack_origin);
+	MONO_API void
+		mono_stack_walk_bounded(MonoStackWalk func, MonoArray* startRef, MonoArray* endRef, void* user_data);
+
+}
+
 #include <mono/metadata/exception.h>
 #include <mono/metadata/mono-debug.h>
 #include <mono/metadata/mono-gc.h>
 #include <mono/metadata/profiler.h>
+
+#ifndef FALSE
+#define FALSE 0
+#endif
+
+#ifndef TRUE
+#define TRUE 1
+#endif
+
+#include <msgpack.hpp>
 
 #include <shared_mutex>
 
@@ -92,7 +120,7 @@ static int CoreClrCallback(const char* imageName)
 }
 #endif
 
-static void OutputExceptionDetails(MonoObject* exc)
+static void OutputExceptionDetails(MonoObject* exc, bool fatal = true)
 {
 	MonoClass* eclass = mono_object_get_class(exc);
 
@@ -112,13 +140,20 @@ static void OutputExceptionDetails(MonoObject* exc)
 			msg = (MonoString*)mono_runtime_invoke(getter, exc, NULL, NULL);
 		}
 
-		GlobalError("Unhandled exception in Mono script environment: %s %s", mono_string_to_utf8(msg), mono_string_to_utf8(msg2));
+		if (fatal)
+		{
+			GlobalError("Unhandled exception in Mono script environment: %s\n%s", mono_string_to_utf8(msg), mono_string_to_utf8(msg2));
+		}
+		else
+		{
+			trace("Exception in Mono script environment: %s\n%s", mono_string_to_utf8(msg), mono_string_to_utf8(msg2));
+		}
 	}
 }
 
-static void GI_PrintLogCall(MonoString* str)
+static void GI_PrintLogCall(MonoString* channel, MonoString* str)
 {
-	trace("%s", mono_string_to_utf8(str));
+	console::Printf(mono_string_to_utf8(channel), "%s", mono_string_to_utf8(str));
 }
 
 static void
@@ -138,12 +173,37 @@ struct _MonoProfiler
 
 MonoProfiler _monoProfiler;
 
+#ifdef _WIN32
+// custom heap so we won't end up depending on any suspended threads
+// (we need to be safe even if the GC suspended the world)
+static HANDLE g_heap = HeapCreate(0, 0, 0);
+
+template<typename T>
+struct StaticHeapAllocator
+{
+	using value_type = T;
+
+	T* allocate(size_t n)
+	{
+		return (T*)HeapAlloc(g_heap, 0, n * sizeof(T));
+	}
+
+	void deallocate(T* p, size_t n)
+	{
+		HeapFree(g_heap, 0, p);
+	}
+};
+
+static std::map<MonoDomain*, uint64_t, std::less<>, StaticHeapAllocator<std::pair<MonoDomain* const, uint64_t>>> g_memoryUsages;
+#else
 static std::map<MonoDomain*, uint64_t> g_memoryUsages;
+#endif
+
 static std::shared_mutex g_memoryUsagesMutex;
 
 static bool g_requestedMemoryUsage;
 
-#ifdef _MSC_VER
+#ifndef IS_FXSERVER
 static void gc_event(MonoProfiler *profiler, MonoGCEvent event, int generation)
 #else
 static void gc_event(MonoProfiler *profiler, MonoProfilerGCEvent event, int generation)
@@ -182,6 +242,170 @@ static uint64_t GI_GetMemoryUsage()
 	return g_memoryUsages[monoDomain];
 }
 
+static bool GI_SnapshotStackBoundary(MonoArray** blob)
+{
+#if _WIN32
+	*blob = mono_get_current_context((void*)((uintptr_t)_AddressOfReturnAddress() + sizeof(void*)));
+#else
+	*blob = mono_get_current_context((void*)((uintptr_t)__builtin_frame_address(0U) + sizeof(void*)));
+#endif
+
+	return true;
+}
+
+struct ScriptStackFrame
+{
+	std::string name;
+	std::string file;
+	std::string sourcefile;
+	int line;
+
+	MonoMethod* method;
+
+	ScriptStackFrame()
+		: method(nullptr), line(0)
+	{
+	}
+
+	MSGPACK_DEFINE_MAP(name, file, sourcefile, line);
+};
+
+MonoMethod* g_getMethodDisplayStringMethod;
+
+static bool GI_WalkStackBoundary(MonoString* resourceName, MonoArray* start, MonoArray* end, MonoArray** outBlob)
+{
+	struct WD
+	{
+		MonoString* resourceName;
+		std::vector<ScriptStackFrame> frames;
+	} wd;
+
+	wd.resourceName = resourceName;
+
+	mono_stack_walk_bounded([](MonoMethod* method, int32_t native_offset, int32_t il_offset, mono_bool managed, void* data)
+	{
+		WD* d = (WD*)data;
+
+		auto ma = mono_image_get_assembly(mono_class_get_image(mono_method_get_class(method)));
+		auto man = mono_assembly_get_name(ma);
+		auto s = mono_assembly_name_get_name(man);
+
+		if (strstr(s, "CitizenFX.Core") || strstr(s, "mscorlib") || strncmp(s, "System", 6) == 0)
+		{
+			return FALSE;
+		}
+
+		ScriptStackFrame ssf;
+		ssf.name = mono_method_get_name(method);
+		ssf.method = method;
+
+		auto sl = mono_debug_lookup_source_location(method, native_offset, mono_domain_get());
+
+		ssf.file = fmt::sprintf("@%s/%s.dll", mono_string_to_utf8(d->resourceName), s);
+
+		if (sl)
+		{
+			ssf.sourcefile = sl->source_file;
+			ssf.line = sl->row;
+		}
+
+		d->frames.push_back(ssf);
+
+		return FALSE;
+	}, start, end, &wd);
+
+	auto description = mono_method_desc_new("System.Reflection.RuntimeMethodInfo:GetMethodFromHandleInternalType", 1);
+	auto method = mono_method_desc_search_in_image(description, mono_get_corlib());
+	mono_method_desc_free(description);
+
+	// pre-corefx import mono name
+	if (!method)
+	{
+		description = mono_method_desc_new("System.Reflection.MethodBase:GetMethodFromHandleInternalType", 1);
+		method = mono_method_desc_search_in_image(description, mono_get_corlib());
+		mono_method_desc_free(description);
+	}
+
+	for (auto& frame : wd.frames)
+	{
+		if (frame.method)
+		{
+			void* zero = nullptr;
+			void* args[] = { &frame.method, &zero };
+
+			MonoObject* exc = nullptr;
+			auto methodInfo = mono_runtime_invoke(method, nullptr, args, &exc);
+
+			if (!exc && methodInfo)
+			{
+				args[0] = methodInfo;
+				auto resolvedMethod = mono_runtime_invoke(g_getMethodDisplayStringMethod, nullptr, args, &exc);
+
+				if (!exc && resolvedMethod)
+				{
+					auto str = mono_object_to_string(resolvedMethod, &exc);
+
+					if (!exc && str)
+					{
+						frame.name = mono_string_to_utf8(str);
+					}
+				}
+			}
+
+			if (exc)
+			{
+				OutputExceptionDetails(exc, false);
+			}
+		}
+	}
+
+	msgpack::sbuffer sb;
+	msgpack::pack(sb, wd.frames);
+
+	MonoArray* blob = mono_array_new(mono_domain_get(), mono_get_byte_class(), sb.size());
+	mono_value_copy_array(blob, 0, sb.data(), sb.size());
+
+	*outBlob = blob;
+
+	return true;
+}
+
+#ifndef IS_FXSERVER
+MonoMethod* g_tickMethod;
+
+extern "C" DLL_EXPORT void GI_TickInDomain(MonoAppDomain* domain)
+{
+	auto targetDomain = mono_domain_from_appdomain(domain);
+
+	if (!targetDomain)
+	{
+		return;
+	}
+
+	auto currentDomain = mono_domain_get();
+
+	if (currentDomain != targetDomain)
+	{
+		mono_thread_push_appdomain_ref(targetDomain);
+
+		if (!mono_domain_set(targetDomain, false))
+		{
+			mono_thread_pop_appdomain_ref();
+			return;
+		}
+	}
+	
+	MonoObject* exc = nullptr;
+	mono_runtime_invoke(g_tickMethod, nullptr, nullptr, &exc);
+
+	if (currentDomain != targetDomain)
+	{
+		mono_domain_set(currentDomain, true);
+		mono_thread_pop_appdomain_ref();
+	}
+}
+#endif
+
 MonoMethod* g_getImplementsMethod;
 MonoMethod* g_createObjectMethod;
 
@@ -215,6 +439,13 @@ static void InitMono()
 
 	mono_assembly_setrootdir(citizenClrPath.c_str());
 
+	// https://github.com/mono/mono/pull/9811
+	// https://www.mono-project.com/docs/advanced/runtime/docs/coop-suspend/#cant-handle-the-embedding-api
+	// Mono coop suspend does not work for embedders, and on systems not designed for multithreading (aka any POSIX system)
+	// it'll infinitely wait for the main thread's infinite loop to handle a GC suspend call. Since the 'yield for the GC'
+	// API isn't exposed, and it's clearly not meant for embedding, we just switch to the old non-coop suspender.
+	putenv("MONO_THREADS_SUSPEND=preemptive");
+
 	putenv("MONO_DEBUG=casts");
 
 #ifndef IS_FXSERVER
@@ -227,21 +458,23 @@ static void InitMono()
 	mono_profiler_set_events(MONO_PROFILE_GC);
 #endif
 
-	char* args[1];
+	char* args[2];
 
 #ifdef _WIN32
 	args[0] = "--soft-breakpoints";
+	args[1] = "--optimize=peephole,cfold,inline,consprop,copyprop,deadce,branch,linears,intrins,loop,exception,cmov,gshared,simd,alias-analysis,float32,unsafe";
 #else
 	args[0] = "--use-fallback-tls";
+	args[1] = "";
 #endif
 
-	mono_jit_parse_options(1, args);
+	mono_jit_parse_options(std::size(args), args);
 
 	mono_debug_init(MONO_DEBUG_FORMAT_MONO);
 
 	g_rootDomain = mono_jit_init_version("Citizen", "v4.0.30319");
 
-	mono_domain_set_config(g_rootDomain, ".", "cfx.config");
+	mono_domain_set_config(g_rootDomain, MakeRelativeNarrowPath("").c_str(), "cfx.config");
 
 	mono_install_unhandled_exception_hook([] (MonoObject* exc, void*)
 	{
@@ -252,7 +485,14 @@ static void InitMono()
 
 	mono_add_internal_call("CitizenFX.Core.GameInterface::PrintLog", reinterpret_cast<void*>(GI_PrintLogCall));
 	mono_add_internal_call("CitizenFX.Core.GameInterface::fwFree", reinterpret_cast<void*>(fwFree));
+
+#ifndef IS_FXSERVER
+	mono_add_internal_call("CitizenFX.Core.GameInterface::TickInDomain", reinterpret_cast<void*>(GI_TickInDomain));
+#endif
+
 	mono_add_internal_call("CitizenFX.Core.GameInterface::GetMemoryUsage", reinterpret_cast<void*>(GI_GetMemoryUsage));
+	mono_add_internal_call("CitizenFX.Core.GameInterface::WalkStackBoundary", reinterpret_cast<void*>(GI_WalkStackBoundary));
+	mono_add_internal_call("CitizenFX.Core.GameInterface::SnapshotStackBoundary", reinterpret_cast<void*>(GI_SnapshotStackBoundary));
 
 	std::string platformPath = MakeRelativeNarrowPath("citizen/clr2/lib/mono/4.5/CitizenFX.Core.dll");
 
@@ -277,6 +517,11 @@ static void InitMono()
 	method_search("CitizenFX.Core.RuntimeManager:Initialize", rtInitMethod);
 	method_search("CitizenFX.Core.RuntimeManager:GetImplementedClasses", g_getImplementsMethod);
 	method_search("CitizenFX.Core.RuntimeManager:CreateObjectInstance", g_createObjectMethod);
+	method_search("System.Diagnostics.EnhancedStackTrace:GetMethodDisplayString", g_getMethodDisplayStringMethod);
+
+#ifndef IS_FXSERVER
+	method_search("CitizenFX.Core.InternalManager:TickGlobal", g_tickMethod);
+#endif
 
 	if (!methodSearchSuccess)
 	{
@@ -316,7 +561,7 @@ struct MonoAttachment
 	}
 };
 
-static void MonoEnsureThreadAttached()
+DLL_EXPORT void MonoEnsureThreadAttached()
 {
 	static thread_local MonoAttachment attachment;
 }
@@ -374,5 +619,15 @@ std::vector<guid_t> MonoGetImplementedClasses(const guid_t& iid)
 
 static InitFunction initFunction([] ()
 {
+	// should've been ResourceManager but ResourceManager OnTick happens _after_ individual resource ticks
+	// which is too early for on-start Mono resources to have run
+	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* instance)
+	{
+		instance->OnTick.Connect([]()
+		{
+			MonoEnsureThreadAttached();
+		}, INT32_MIN);
+	});
+
 	InitMono();
 });

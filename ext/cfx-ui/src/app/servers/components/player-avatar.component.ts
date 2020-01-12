@@ -1,5 +1,5 @@
-import { Component, Input, OnInit, OnChanges, SimpleChanges } from '@angular/core';
-import { Http } from '@angular/http';
+import { Component, Input, OnInit, OnChanges, SimpleChanges, PLATFORM_ID, Inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
 import { DomSanitizer, SafeStyle } from '@angular/platform-browser';
 
 import { Avatar } from '../avatar';
@@ -10,6 +10,7 @@ import { delay, share, map } from 'rxjs/operators';
 
 import { Int64BE } from 'int64-buffer';
 import { xml2js, ElementCompact } from 'xml-js';
+import { isPlatformBrowser } from '@angular/common';
 
 @Component({
     moduleId: module.id,
@@ -26,7 +27,7 @@ export class PlayerAvatarComponent implements OnInit, OnChanges {
 
     private svgUrl: string;
 
-    constructor(private sanitizer: DomSanitizer, private http: Http) {
+    constructor(private sanitizer: DomSanitizer, private http: HttpClient, @Inject(PLATFORM_ID) private platformId: any) {
 
     }
 
@@ -42,13 +43,13 @@ export class PlayerAvatarComponent implements OnInit, OnChanges {
         for (const identifier of this.player.identifiers) {
             const stringId = (<string>identifier);
 
-            if (stringId.startsWith('steam:')) {
+            if (this.isBrowser() && stringId.startsWith('steam:')) {
                 const int = new Int64BE(stringId.substr(6), 16);
                 const decId = int.toString(10);
 
-                return this.http.get(`https://steamcommunity.com/profiles/${decId}?xml=1`)
+                return this.http.get(`https://steamcommunity.com/profiles/${decId}?xml=1`, { responseType: 'text' })
                                 .map(a => {
-                                    const obj = xml2js(a.text(), { compact: true }) as ElementCompact;
+                                    const obj = xml2js(a, { compact: true }) as ElementCompact;
 
                                     if (obj && obj.profile && obj.profile.avatarMedium) {
                                         return obj.profile.avatarMedium._cdata
@@ -61,6 +62,10 @@ export class PlayerAvatarComponent implements OnInit, OnChanges {
         }
 
         return of(this.sanitizer.bypassSecurityTrustUrl(this.svgUrl));
+    }
+
+    isBrowser() {
+        return isPlatformBrowser(this.platformId);
     }
 
     public ngOnChanges(changes: SimpleChanges) {

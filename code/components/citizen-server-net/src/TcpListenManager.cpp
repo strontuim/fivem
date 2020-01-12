@@ -14,15 +14,16 @@
 
 namespace fx
 {
-	TcpListenManager::TcpListenManager()
+	TcpListenManager::TcpListenManager(const std::string& loopName)
+		: m_primaryPort(0)
 	{
-		Initialize();
+		Initialize(loopName);
 	}
 
-	void TcpListenManager::Initialize()
+	void TcpListenManager::Initialize(const std::string& loopName)
 	{
 		// initialize a TCP stack
-		m_tcpStack = new net::TcpServerManager();
+		m_tcpStack = new net::TcpServerManager(loopName);
 	}
 
 	void TcpListenManager::AddEndpoint(const std::string& endPoint)
@@ -33,6 +34,13 @@ namespace fx
 		// if a peer address is set
 		if (peerAddress.is_initialized())
 		{
+			// if the primary port isn't set, set it
+			if (m_primaryPort == 0)
+			{
+				m_primaryPort = peerAddress->GetPort();
+				m_primaryPortVar->GetHelper()->SetRawValue(m_primaryPort);
+			}
+
 			// create a multiplexable TCP server and bind it
 			fwRefContainer<net::MultiplexTcpBindServer> server = new net::MultiplexTcpBindServer(m_tcpStack);
 			server->Bind(peerAddress.get());
@@ -45,6 +53,20 @@ namespace fx
 		}
 	}
 
+	void TcpListenManager::AddExternalServer(const fwRefContainer<net::TcpServer>& server)
+	{
+		// attach and create a multiplex
+		fwRefContainer<net::MultiplexTcpServer> multiplex = new net::MultiplexTcpServer();
+		multiplex->AttachToServer(server);
+
+		// store the server
+		m_externalServers.push_back(server);
+		m_multiplexServers.push_back(multiplex);
+
+		// set up the multiplex
+		OnInitializeMultiplexServer(multiplex);
+	}
+
 	void TcpListenManager::AttachToObject(ServerInstanceBase* instance)
 	{
 		instance->SetComponent(m_tcpStack);
@@ -53,6 +75,8 @@ namespace fx
 		{
 			AddEndpoint(endPoint);
 		});
+
+		m_primaryPortVar = instance->AddVariable<int>("netPort", ConVar_None, m_primaryPort);
 	}
 }
 

@@ -18,7 +18,16 @@ extern OsrImeHandlerWin* g_imeHandler;
 NUIRenderHandler::NUIRenderHandler(NUIClient* client)
 	: m_paintingPopup(false), m_owner(client), m_currentDragOp(DRAG_OPERATION_NONE)
 {
-	auto hWnd = FindWindow(L"grcWindow", nullptr);
+	auto hWnd = FindWindow(
+#ifdef GTA_FIVE
+		L"grcWindow"
+#elif defined(IS_RDR3)
+		L"sgaWindow"
+#else
+		L"UNKNOWN_WINDOW"
+#endif
+	, nullptr);
+
 	m_dropTarget = DropTargetWin::Create(this, hWnd);
 
 	HRESULT hr = RegisterDragDrop(hWnd, m_dropTarget);
@@ -53,23 +62,15 @@ void NUIRenderHandler::OnImeCompositionRangeChanged(CefRefPtr<CefBrowser> browse
 
 void NUIRenderHandler::OnAcceleratedPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList& dirtyRects, void* shared_handle)
 {
-	if (type == PET_VIEW)
+	if (m_owner->GetWindowValid())
 	{
-		if (m_owner->GetWindowValid())
-		{
-			m_owner->GetWindow()->UpdateSharedResource(shared_handle, -1, dirtyRects);
-		}
+		m_owner->GetWindow()->UpdateSharedResource(shared_handle, -1, dirtyRects, type);
 	}
 }
 
 void NUIRenderHandler::OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList& dirtyRects, const void* buffer, int width, int height)
 {
-	// OnPaint shouldn't be reached anymore
-	//assert(!"NUIRenderHandler::OnPaint");
-
-	return;
-
-	if (m_owner->GetWindowValid())
+	if (m_owner->GetWindowValid() && m_owner->GetWindow()->GetRenderBuffer())
 	{
 		// lock the window lock
 		auto& lock = m_owner->GetWindowLock();
@@ -110,6 +111,9 @@ void NUIRenderHandler::OnPopupShow(CefRefPtr<CefBrowser> browser, bool show)
 		m_popupRect.Set(0, 0, 0, 0);
 		browser->GetHost()->Invalidate(PET_VIEW);
 	}
+
+	// accelerated handling
+	m_owner->GetWindow()->HandlePopupShow(show);
 }
 
 void NUIRenderHandler::OnPopupSize(CefRefPtr<CefBrowser> browser, const CefRect& rect)
@@ -152,6 +156,9 @@ void NUIRenderHandler::OnPopupSize(CefRefPtr<CefBrowser> browser, const CefRect&
 	{
 		m_popupRect.y = 0;
 	}
+
+	// accelerated handling
+	m_owner->GetWindow()->SetPopupRect(m_popupRect);
 }
 
 void NUIRenderHandler::UpdatePopup()
@@ -177,7 +184,6 @@ void NUIRenderHandler::PaintView(const RectList& dirtyRects, const void* buffer,
 
 	for (auto& rect : dirtyRects)
 	{
-		if (!rage::grcTexture::IsRenderSystemColorSwapped())
 		{
 			for (int y = rect.y; y < (rect.y + rect.height); y++)
 			{
@@ -186,10 +192,6 @@ void NUIRenderHandler::PaintView(const RectList& dirtyRects, const void* buffer,
 
 				memcpy(dest, src, (rect.width * 4));
 			}
-		}
-		else
-		{
-			ConvertImageDataRGBA_BGRA(rect.x, rect.y, rect.width, rect.height, width * 4, buffer, roundedWidth * 4, renderBuffer);
 		}
 
 		window->AddDirtyRect(rect);
@@ -233,7 +235,6 @@ void NUIRenderHandler::PaintPopup(const void* buffer, int width, int height)
 	void* renderBuffer = window->GetRenderBuffer();
 	int roundedWidth = window->GetRoundedWidth();
 
-	if (!rage::grcTexture::IsRenderSystemColorSwapped())
 	{
 		for (int y = yy; y < (yy + h); y++)
 		{
@@ -242,10 +243,6 @@ void NUIRenderHandler::PaintPopup(const void* buffer, int width, int height)
 
 			memcpy(dest, src, (w * 4));
 		}
-	}
-	else
-	{
-		ConvertImageDataRGBA_BGRA(x, yy, w, h, width * 4, buffer, roundedWidth * 4, renderBuffer);
 	}
 
 	// add dirty rect
@@ -269,7 +266,15 @@ bool NUIRenderHandler::StartDragging(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 	m_currentDragOp = DRAG_OPERATION_NONE;
 	POINT pt = {};
 	GetCursorPos(&pt);
-	ScreenToClient(FindWindow(L"grcWindow", nullptr), &pt);
+	ScreenToClient(FindWindow(
+#ifdef GTA_FIVE
+		L"grcWindow"
+#elif defined(IS_RDR3)
+		L"sgaWindow"
+#else
+		L"UNKNOWN_WINDOW"
+#endif	
+	, nullptr), &pt);
 
 	browser->GetHost()->DragSourceEndedAt(
 		pt.x,

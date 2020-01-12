@@ -44,7 +44,7 @@ static const char *const luaX_tokens [] = {
     "return", "then", "true", "until", "while",
     "//", "..", "...", "==", ">=", "<=", "~=",
     "<<", ">>", "::", "<eof>",
-    "<number>", "<integer>", "<name>", "<string>"
+    "<number>", "<integer>", "<name>", "<string>", "<hash>"
 };
 
 
@@ -95,7 +95,7 @@ const char *luaX_token2str (LexState *ls, int token) {
 
 static const char *txtToken (LexState *ls, int token) {
   switch (token) {
-    case TK_NAME: case TK_STRING:
+    case TK_NAME: case TK_STRING: case TK_HASH:
     case TK_FLT: case TK_INT:
       save(ls, '\0');
       return luaO_pushfstring(ls->L, "'%s'", luaZ_buffer(ls->buff));
@@ -537,7 +537,7 @@ static int llex (LexState *ls, SemInfo *seminfo) {
       }
       case '`': {  /* relative paths */
         read_string(ls, ls->current, seminfo);
-        return TK_PATH;
+        return TK_HASH;
       }
       case '.': {  /* '.', '..', '...', or number */
         save_and_next(ls);

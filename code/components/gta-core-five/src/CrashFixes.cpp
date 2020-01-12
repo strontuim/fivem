@@ -10,6 +10,9 @@
 
 #include <Error.h>
 
+#include <ICoreGameInit.h>
+#include <gameSkeleton.h>
+
 #include <LaunchMode.h>
 
 static void* ProbePointer(char* pointer)
@@ -145,32 +148,6 @@ static bool VehicleEntryPointValidate(VehicleLayoutInfo* info)
 	return true;
 }
 
-#include <atPool.h>
-
-static void(*g_origUnloadMapTypes)(void*, uint32_t);
-
-void fwMapTypesStore__Unload(char* assetStore, uint32_t index)
-{
-	auto pool = (atPoolBase*)(assetStore + 56);
-	auto entry = pool->GetAt<char>(index);
-
-	if (entry != nullptr)
-	{
-		if (*(uintptr_t*)entry != 0)
-		{
-			g_origUnloadMapTypes(assetStore, index);
-		}
-		else
-		{
-			AddCrashometry("maptypesstore_workaround_2", "true");
-		}
-	}
-	else
-	{
-		AddCrashometry("maptypesstore_workaround", "true");
-	}
-}
-
 static int ReturnFalse()
 {
 	return 0;
@@ -192,7 +169,126 @@ static bool LoadFromStructureCharHook(void* parManager, const char* fileName, co
 	return result;
 }
 
-static HookFunction hookFunction([] ()
+void(*g_origReinitRenderPhase)(void*);
+
+static void* g_pendingReinit;
+
+void ReinitRenderPhaseWrap(void* a)
+{
+	if (!Instance<ICoreGameInit>::Get()->HasVariable("shutdownGame"))
+	{
+		g_origReinitRenderPhase(a);
+	}
+	else
+	{
+		g_pendingReinit = a;
+	}
+}
+
+static void(*g_origCVehicleModelInfo__init)(void* mi, void* data);
+
+static hook::cdecl_stub<void*(uint32_t)> _getExplosionInfo([]()
+{
+	return hook::get_call(hook::get_pattern("BA 52 28 0C 03 85 D2 74 09 8B CA E8", 11));
+});
+
+void CVehicleModelInfo__init(char* mi, char* data)
+{
+	uint32_t explosionHash = *(uint32_t*)(data + 96);
+
+	if (!explosionHash || !_getExplosionInfo(explosionHash))
+	{
+		explosionHash = HashString("explosion_info_default");
+	}
+
+	*(uint32_t*)(data + 96) = explosionHash;
+
+	g_origCVehicleModelInfo__init(mi, data);
+}
+
+static uint32_t(*g_origScrProgramReturn)(void* a1, uint32_t a2);
+
+static uint32_t ReturnIfMp(void* a1, uint32_t a2)
+{
+	if (Instance<ICoreGameInit>::Get()->HasVariable("storyMode"))
+	{
+		return g_origScrProgramReturn(a1, a2);
+	}
+
+	return -1;
+}
+
+#include <atArray.h>
+
+struct grcVertexProgram
+{
+	void* vtbl;
+	const char* name;
+	char pad[568];
+};
+
+struct grmShaderProgram
+{
+	char pad[48];
+	atArray<grcVertexProgram> vertexPrograms;
+};
+
+struct grmShaderFx
+{
+	void* padParams;
+	grmShaderProgram* program;
+};
+
+static void(*g_origDrawModelGeometry)(grmShaderFx* shader, int a2, void* a3, int a4, bool a5);
+
+static void DrawModelGeometryHook(grmShaderFx* shader, int a2, void* a3, int a4, bool a5)
+{
+	if (shader->program && shader->program->vertexPrograms.GetSize() && shader->program->vertexPrograms[0].name && strstr(shader->program->vertexPrograms[0].name, "_batch:") != nullptr)
+	{
+		return;
+	}
+
+	g_origDrawModelGeometry(shader, a2, a3, a4, a5);
+}
+
+static void(*g_origCText__UnloadSlot)(int slotId, bool a2);
+
+static void CText__UnloadSlotHook(int slotId, bool a2)
+{
+	if (slotId > 20)
+	{
+		return;
+	}
+
+	g_origCText__UnloadSlot(slotId, a2);
+}
+
+static bool(*g_origCText__IsSlotLoaded)(void* text, int slot);
+
+static bool CText__IsSlotLoadedHook(void* text, int slot)
+{
+	if (slot > 20)
+	{
+		return true;
+	}
+
+	return g_origCText__IsSlotLoaded(text, slot);
+}
+
+static void(*g_origCText__LoadSlot)(void* text, void* name, int slot, int a4);
+
+static void CText__LoadSlotHook(void* text, void* name, int slot, int a4)
+{
+	if (slot > 20)
+	{
+		trace("REQUEST_ADDITIONAL_TEXT has a slot range of 0 to 19 (inclusive). Slot %d is out of this range, so it has been ignored.\n", slot);
+		return;
+	}
+
+	return g_origCText__LoadSlot(text, name, slot, a4);
+}
+
+static HookFunction hookFunction{[] ()
 {
 	// corrupt TXD store reference crash (ped decal-related?)
 	static struct : jitasm::Frontend
@@ -218,7 +314,10 @@ static HookFunction hookFunction([] ()
 	if (!CfxIsSinglePlayer())
 	{
 		// unknown function doing 'something' to scrProgram entries for a particular scrThread - we of course don't have any scrProgram
-		hook::jump(hook::pattern("8B 59 14 44 8B 79 18 8B FA 8B 51 0C").count(1).get(0).get<void>(-0x1D), ReturnInt<-1>);
+		//hook::jump(hook::pattern("8B 59 14 44 8B 79 18 8B FA 8B 51 0C").count(1).get(0).get<void>(-0x1D), ReturnInt<-1>);
+		MH_Initialize();
+		MH_CreateHook(hook::pattern("8B 59 14 44 8B 79 18 8B FA 8B 51 0C").count(1).get(0).get<void>(-0x1D), ReturnIfMp, (void**)&g_origScrProgramReturn);
+		MH_EnableHook(MH_ALL_HOOKS);
 	}
 
 	// make sure a drawfrag dc doesn't actually run if there's no frag (bypass ERR_GFX_DRAW_DATA)
@@ -596,9 +695,9 @@ static HookFunction hookFunction([] ()
 	// fix STAT_SET_INT saving for unknown-typed stats directly using stack garbage as int64
 	hook::put<uint16_t>(hook::get_pattern("FF C8 0F 84 85 00 00 00 83 E8 12 75 6A", 13), 0x7EEB);
 
-	// fwMapTypesStore double unloading workaround
+	// vehicles.meta explosionInfo field invalidity
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("4C 63 C2 33 ED 46 0F B6 0C 00 8B 41 4C", -18), fwMapTypesStore__Unload, (void**)&g_origUnloadMapTypes);
+	MH_CreateHook(hook::get_pattern("4C 8B F2 4C 8B F9 FF 50 08 4C 8D 05", -0x28), CVehicleModelInfo__init, (void**)&g_origCVehicleModelInfo__init);
 	MH_EnableHook(MH_ALL_HOOKS);
 
 	// disable TXD script resource unloading to work around a crash
@@ -627,11 +726,79 @@ static HookFunction hookFunction([] ()
 		hook::put<uint32_t>(location - 12, 400 * sizeof(void*));
 	}
 
+	// don't initialize/update render phases right after a renderer reinitialization (this *also* gets done by gameSkeleton update normally)
+	// if the game is unloaded, this'll fail because camManager is not initialized
+	// 1604 signature: magnesium-september-wisconsin (FIVEM-CLIENT-1604-34)
+	//                 massachusetts-skylark-black   (FIVEM-CLIENT-1604-3D) <- CPedFactory::ms_playerPed being NULL with same call stack in CPortalTracker
+	{
+		auto location = hook::get_pattern("48 8D 0D ? ? ? ? E8 ? ? ? ? 84 DB 74 0C 48 8D 0D", 23);
+		hook::set_call(&g_origReinitRenderPhase, location);
+		hook::call(location, ReinitRenderPhaseWrap);
+
+		if (!CfxIsSinglePlayer())
+		{
+			Instance<ICoreGameInit>::Get()->OnGameFinalizeLoad.Connect([]()
+			{
+				if (g_pendingReinit)
+				{
+					trace("Attempted a mode change during shutdown - executing it now...\n");
+
+					g_origReinitRenderPhase(g_pendingReinit);
+					g_pendingReinit = nullptr;
+				}
+			});
+		}
+	}
+
+	// CScene_unk_callsBlenderM58: over 50 iterated objects (CEntity+40 == 5, CObject) will lead to a stack buffer overrun
+	// 1604 signature: happy-venus-purple (FIVEM-CLIENT-1604-NEW-18G4)
+	{
+		static struct : jitasm::Frontend
+		{
+			void InternalMain() override
+			{
+				cmp(rbx, 50);
+				jge("nope");
+
+				mov(qword_ptr[rbp + rbx * 8 + 0x190], rax);
+				ret();
+
+				L("nope");
+
+				dec(edi);
+				dec(rbx);
+
+				ret();
+			}
+		} objectArrayStub;
+
+		auto location = hook::get_pattern("48 89 84 DD 90 01 00 00");
+		hook::nop(location, 8);
+		hook::call_rcx(location, objectArrayStub.GetCode());
+	}
+
+	// don't allow rendering grass_batch from plain geometry draw functions
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("4D 8B F0 44 8A 44 24 50 41 8B", -0x19), DrawModelGeometryHook, (void**)&g_origDrawModelGeometry);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
 	// parser errors: rage::parManager::LoadFromStructure(const char*/fiStream*) returns true when LoadTree fails, and
 	// only returns false if LoadFromStructure(parTreeNode*) fails
 	// make it return failure state on failure of rage::parManager::LoadTree as well, and log the failure.
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("4C 8B EA 48 8B F1 E8 ? ? ? ? 40 B5 01 48 8B F8", -0x2D), LoadFromStructureCharHook, (void**)&g_origLoadFromStructureChar);
 	// TODO: fiStream version?
+
+	// CText: don't allow loading additional text in slots above 19 (leads to arbitrary memory corruption)
+	MH_CreateHook(hook::get_pattern("EB 08 C7 44 24 20 01 00 00 00 45 33 C9", -0x17), CText__LoadSlotHook, (void**)&g_origCText__LoadSlot);
+
+	// hook to pretend any such slot is loaded
+	MH_CreateHook(hook::get_pattern("75 0D F6 84 08 ? ? 00 00", -0xB), CText__IsSlotLoadedHook, (void**)&g_origCText__IsSlotLoaded);
+
+	// and to prevent unloading
+	MH_CreateHook(hook::get_pattern("41 BD D8 00 00 00 39 6B 60 74", -0x30), CText__UnloadSlotHook, (void**)&g_origCText__UnloadSlot);
+
 	MH_EnableHook(MH_ALL_HOOKS);
-});
+} };

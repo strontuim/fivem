@@ -1,5 +1,7 @@
 -- to work around slow init times due to packagesrv.com being down
-http = nil
+premake.downloadModule = function()
+	return false
+end
 
 xpcall(function()
 newoption {
@@ -59,7 +61,7 @@ workspace "CitizenMP"
 		"client/shared/",
 		"../vendor/jitasm/",
 		"../vendor/rapidjson/include/",
-		"../vendor/fmtlib/",
+		"../vendor/fmtlib/include/",
 		"deplibs/include/",
 		os.getenv("BOOST_ROOT")
 	}
@@ -73,13 +75,13 @@ workspace "CitizenMP"
 	location ((_OPTIONS['builddir'] or "build/") .. _OPTIONS['game'])
 
 	if os.istarget('windows') then
-		buildoptions '/std:c++latest'
+		buildoptions '/std:c++17'
 		
 		if _OPTIONS['game'] ~= 'server' then
 			buildoptions '/await'
 		end
 
-		systemversion '10.0.17134.0'
+		systemversion '10.0.18362.0'
 	end
 
 	-- special build dirs for FXServer
@@ -131,6 +133,18 @@ workspace "CitizenMP"
 
 		filter 'language:C or language:C++'
 			architecture 'x64'
+			
+	configuration "game=rdr3"
+		defines "IS_RDR3"
+
+		filter 'language:C or language:C++'
+			architecture 'x64'
+			
+	configuration "game=launcher"
+		defines "IS_LAUNCHER"
+
+		filter 'language:C or language:C++'
+			architecture 'x64'
 
 	configuration "windows"
 		links { "winmm" }
@@ -138,7 +152,7 @@ workspace "CitizenMP"
 	filter { 'system:not windows', 'language:C or language:C++' }
 		architecture 'x64'
 		
-		links { 'c++' }
+		links { 'stdc++' }
 
 		buildoptions {
 			"-fPIC", -- required to link on AMD64
@@ -149,6 +163,7 @@ workspace "CitizenMP"
 		-- game launcher
 		include 'client/launcher'
 		include 'client/console'
+		include 'client/diag'
 	else
 		include 'server/launcher'
 	end
@@ -157,6 +172,8 @@ workspace "CitizenMP"
 	include 'client/citicore'
 
 if _OPTIONS['game'] ~= 'server' then
+	include 'client/ipfsdl'
+
 	project "CitiGame"
 		targetname "CitizenGame"
 		language "C++"
@@ -189,17 +206,84 @@ premake.override(premake.vstudio.dotnetbase, 'debugProps', function(base, cfg)
 	_p(2,'<Optimize>%s</Optimize>', iif(premake.config.isOptimizedBuild(cfg), "true", "false"))
 end)
 
-local function WriteDocumentationFileXml(_premake, _prj, value)
-    _premake.w('<DocumentationFile>' .. string.gsub(_prj.buildtarget.relpath, ".dll", ".xml") .. '</DocumentationFile>')
+premake.override(premake.vstudio.vc2010, 'importLanguageTargets', function(base, prj)
+	base(prj)
+
+	local hasPostBuild = false
+
+	for cfg in premake.project.eachconfig(prj) do
+		if cfg.postbuildcommands and #cfg.postbuildcommands > 0 then
+			hasPostBuild = true
+			break
+		end
+	end
+
+	if hasPostBuild then
+		_p(1, '<Target Name="DisablePostBuildEvent" AfterTargets="Link" BeforeTargets="PostBuildEvent">')
+		_p(2, '<PropertyGroup>')
+		_p(3, '<PostBuildEventUseInBuild Condition="\'$(LinkSkippedExecution)\' == \'True\'">false</PostBuildEventUseInBuild>')
+		_p(2, '</PropertyGroup>')
+		_p(1, '</Target>')
+	end
+end)
+
+local function WriteDocumentationFileXml(_premake, _cfg)
+	if _cfg.project.name == 'CitiMonoSystemDrawingStub' then
+		_premake.w(('<AssemblyOriginatorKeyFile>%s</AssemblyOriginatorKeyFile>'):format(
+			path.getabsolute("client/clrref/msft.snk")
+		))
+		_premake.w('<SignAssembly>true</SignAssembly>')
+		_premake.w('<DelaySign>true</DelaySign>')
+	
+		return
+	end
+
+	if _cfg.project.name ~= 'CitiMono' then
+		return
+	end
+	
+    _premake.w('<DocumentationFile>' .. string.gsub(_cfg.buildtarget.relpath, ".dll", ".xml") .. '</DocumentationFile>')
 end
 
-premake.override(premake.vstudio.dotnetbase, "compilerProps", function(base, prj)
-    base(prj)
-    WriteDocumentationFileXml(premake, prj, XmlDocFileName)
+premake.override(premake.vstudio.dotnetbase, "compilerProps", function(base, cfg)
+    base(cfg)
+    WriteDocumentationFileXml(premake, cfg)
 
     premake.w('<GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>')
 end)
 
+premake.override(premake.vstudio.cs2005, "targets", function(base, prj)
+    base(prj)
+    
+    if prj.name == 'CitiMono' then
+		_p(1, '<PropertyGroup>')
+		_p(2, '<GenAPITargetDir>%s/</GenAPITargetDir>', path.getabsolute("client/clrref/"))
+		_p(2, '<GenAPIAdditionalParameters>%s</GenAPIAdditionalParameters>', ('-excludeApiList:"%s" -excludeAttributesList:"%s"'):format(
+			path.getabsolute("client/clrref/exclude_list.txt"),
+			path.getabsolute("client/clrref/exclude_attributes_list.txt")
+		))
+		_p(2, '<GenerateReferenceAssemblySources>true</GenerateReferenceAssemblySources>')
+		_p(1, '</PropertyGroup>')
+		
+		_p(1, '<Import Project="%s" />', path.getabsolute("client/clrcore/GenAPI.targets"))
+    end
+end)
+
+premake.override(premake.vstudio.nuget2010, "supportsPackageReferences", function(base, prj)
+	-- <PackageReference /> doesn't work for GenAPI (even if fixing `nuget.config` issue for source)
+	return false
+end)
+
+premake.override(premake.vstudio.dotnetbase, "nuGetReferences", function(base, prj)
+	-- and this'll fail as GenAPI doesn't have any lib/.../*.dll file
+	if prj.name == 'CitiMono' then
+		return
+	end
+	
+	return base(prj)
+end)
+
+if _OPTIONS['game'] ~= 'launcher' then
 	project "CitiMono"
 		targetname "CitizenFX.Core"
 		language "C#"
@@ -209,27 +293,118 @@ end)
 		disablewarnings 'CS1591'
 		
 		dotnetframework '4.6'
-
+		
 		clr 'Unsafe'
+		
+		csversion '7.3'
 
 		files { "client/clrcore/*.cs", "client/clrcore/Math/*.cs" }
-
+		
+		files { "../vendor/ben-demystifier/src/Ben.Demystifier/**.cs" }
+		
 		if _OPTIONS['game'] ~= 'server' then
-			files { "client/clrcore/External/*.cs" }
+			defines { 'USE_HYPERDRIVE' }
+			
+			if _OPTIONS['game'] == 'five' then
+				files { "client/clrcore/External/*.cs" }
+			end
 		else
 			files { "client/clrcore/Server/*.cs" }
 		end
+		
+		if os.istarget('windows') then
+			nuget { "Microsoft.DotNet.BuildTools.GenAPI:3.0.0-preview1-03805-01", "Microsoft.DotNet.BuildTools.GenFacades:3.0.0-preview1-03805-01" }
+			nugetsource "https://dotnet.myget.org/F/dotnet-buildtools/api/v3/index.json"
+			
+			
+		end
 
-		links { "System.dll", "Microsoft.CSharp.dll", "System.Core.dll", "../data/client/citizen/clr2/lib/mono/4.5/MsgPack.dll" }
+		links {
+			"System.dll",
+			"Microsoft.CSharp.dll",
+			"System.Core.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/System.Reflection.Metadata.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/System.Collections.Immutable.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/MsgPack.dll"
+		}
 
-		buildoptions '/debug:portable /langversion:7.1'
+		if os.istarget('linux') then
+			links {
+				"/usr/lib/mono/4.5/Facades/System.Runtime.dll",
+				"/usr/lib/mono/4.5/Facades/System.IO.dll"
+			}
+		end
+
+		buildoptions '/debug:portable /langversion:7.3'
 
 		configuration "Debug*"
 			targetdir (binroot .. '/debug/citizen/clr2/lib/mono/4.5/')
 
 		configuration "Release*"
 			targetdir (binroot .. '/release/citizen/clr2/lib/mono/4.5/')
+			
+	if _OPTIONS['game'] ~= 'server' then
+		project "CitiMonoSystemDrawingStub"
+			targetname "System.Drawing"
+			language "C#"
+			kind "SharedLib"
+			
+			links { "CitiMono" }
+			
+			files {
+				"client/clrref/System.Drawing.cs"
+			}
+			
+			configuration "Debug*"
+				targetdir (binroot .. '/debug/citizen/clr2/lib/mono/4.5/')
 
+			configuration "Release*"
+				targetdir (binroot .. '/release/citizen/clr2/lib/mono/4.5/')
+	end
+			
+	if os.istarget('windows') then
+		project "CitiMonoRef"
+			if _OPTIONS['game'] == 'server' then
+				targetname "CitizenFX.Core.Server"
+			else
+				targetname "CitizenFX.Core.Client"
+			end
+			
+			language "C#"
+			kind "SharedLib"
+			
+			dependson "CitiMono"
+			
+			dotnetframework '4.6'
+			clr 'Unsafe'
+			csversion '7.3'
+			
+			links { "System.dll", "System.Drawing.dll" }
+			
+			files { "client/clrref/CitizenFX.Core.cs" }
+			
+			buildoptions '/debug:portable /langversion:7.3'
+			
+			postbuildcommands {
+				('copy /y "%s" "%s"'):format(
+					"$(TargetDir)..\\CitizenFX.Core.xml",
+					"$(TargetDir)$(TargetName).xml"
+				),				
+				('"%s" -facadePath:"%s" -seeds:"%s" -contracts:"%s"'):format(
+					"$(SolutionDir)\\packages\\Microsoft.DotNet.BuildTools.GenFacades.3.0.0-preview1-03805-01\\tools\\GenFacades.exe",
+					"$(TargetDir)..",
+					"$(TargetDir)..\\CitizenFX.Core.dll",
+					"$(TargetPath)"
+				)
+			}
+			
+			configuration "Debug*"
+				targetdir (binroot .. '/debug/citizen/clr2/lib/mono/4.5/ref/')
+
+			configuration "Release*"
+				targetdir (binroot .. '/release/citizen/clr2/lib/mono/4.5/ref/')
+	end
+end
 	group ""
 
 	-- TARGET: shared component
@@ -238,6 +413,8 @@ end)
 	group "vendor"
 
 if _OPTIONS['game'] ~= 'server' then
+	include "tools/dbg"
+
 	project "libcef_dll"
 		targetname "libcef_dll_wrapper"
 		language "C++"

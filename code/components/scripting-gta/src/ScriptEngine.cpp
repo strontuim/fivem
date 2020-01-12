@@ -10,7 +10,7 @@
 
 #include "Hooking.h"
 
-#include <Brofiler.h>
+#include <optick.h>
 
 #include <scrEngine.h>
 
@@ -40,10 +40,35 @@ static inline void CallHandler(const THandler& rageHandler, uint64_t nativeIdent
 #endif
 }
 
+extern "C" bool DLL_EXPORT WrapNativeInvoke(rage::scrEngine::NativeHandler handler, uint64_t nativeIdentifier, rage::scrNativeCallContext* context)
+{
+	static void* exceptionAddress;
+
+	__try
+	{
+		handler(context);
+		return true;
+	}
+	__except (exceptionAddress = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress, EXCEPTION_EXECUTE_HANDLER)
+	{
+		trace("Error executing native %016llx at address %p.\n", nativeIdentifier, exceptionAddress);
+		return false;
+	}
+}
+
+static std::unordered_map<uint64_t, fx::TNativeHandler> g_registeredHandlers;
+
 namespace fx
 {
 	boost::optional<TNativeHandler> ScriptEngine::GetNativeHandler(uint64_t nativeIdentifier)
 	{
+		auto it = g_registeredHandlers.find(nativeIdentifier);
+
+		if (it != g_registeredHandlers.end())
+		{
+			return it->second;
+		}
+
 		auto rageHandler = rage::scrEngine::GetNativeHandler(nativeIdentifier);
 
 		if (rageHandler == nullptr)
@@ -53,17 +78,17 @@ namespace fx
 
 		return boost::optional<TNativeHandler>([=] (ScriptContext& context)
 		{
-/*#if USE_PROFILER
-			static std::unordered_map<uint64_t, Profiler::EventDescription*> staticDescriptions;
+/*#if USE_OPTICK
+			static std::unordered_map<uint64_t, Optick::EventDescription*> staticDescriptions;
 
 			auto it = staticDescriptions.find(nativeIdentifier);
 
 			if (it == staticDescriptions.end())
 			{
-				it = staticDescriptions.emplace(nativeIdentifier, Profiler::EventDescription::Create(va("NativeHandler %llx", nativeIdentifier), __FILE__, __LINE__, Profiler::Color::Azure)).first;
+				it = staticDescriptions.emplace(nativeIdentifier, Optick::EventDescription::Create(va("NativeHandler %llx", nativeIdentifier), __FILE__, __LINE__, Optick::Color::Azure)).first;
 			}
 
-			Profiler::Event ev(*it->second);
+			Optick::Event ev(*it->second);
 #endif*/
 
 			// push arguments from the original context
@@ -103,6 +128,8 @@ namespace fx
 
 	void ScriptEngine::RegisterNativeHandler(uint64_t nativeIdentifier, TNativeHandler function)
 	{
+		g_registeredHandlers[nativeIdentifier] = function;
+
 #ifdef _M_AMD64
 		TNativeHandler* handler = new TNativeHandler(function);
 

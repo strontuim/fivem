@@ -1,4 +1,4 @@
-import { Component, OnInit, OnChanges, OnDestroy, Input, Output, EventEmitter } from '@angular/core';
+import { Component, OnInit, OnChanges, OnDestroy, Input, Output, EventEmitter, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 
 import { Server } from '../server';
 
@@ -10,17 +10,7 @@ import { Subject } from 'rxjs/Subject';
 
 import 'rxjs/add/operator/throttleTime';
 
-export class ServerFilters {
-    public searchText: string;
-    public hideEmpty = false;
-    public hideFull = false;
-	public capPing = false;
-    public maxPing = 0;
-
-    constructor() {
-        this.searchText = '';
-    }
-}
+import { ServerFilters } from './server-filter-container';
 
 class ServerAutocompleteEntry {
     public name = '';
@@ -33,7 +23,8 @@ class ServerAutocompleteEntry {
     moduleId: module.id,
     selector: 'app-server-filter',
     templateUrl: 'server-filter.component.html',
-    styleUrls: ['server-filter.component.scss']
+    styleUrls: ['server-filter.component.scss'],
+    changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class ServerFilterComponent implements OnInit, OnChanges, OnDestroy {
     filters: ServerFilters = new ServerFilters();
@@ -65,7 +56,7 @@ export class ServerFilterComponent implements OnInit, OnChanges, OnDestroy {
 	private minPingLimit = 30;
     private maxPingLimit = 200;
 
-    constructor(private serversService: ServersService, private gameService: GameService) {
+    constructor(private serversService: ServersService, private gameService: GameService, private cdr: ChangeDetectorRef) {
         this.serversService
             .getReplayedServers()
             .filter(server => !server)
@@ -183,10 +174,6 @@ export class ServerFilterComponent implements OnInit, OnChanges, OnDestroy {
             this.selectedCompletionIndex = -1;
         }
 
-		let pingBar = document.getElementById("progress").clientWidth;
-		let widthPercent = (this.filters.maxPing-this.minPingLimit)/(this.maxPingLimit-this.minPingLimit);
-		this.maxPingPercent = widthPercent*100;
-		
         this.filtersChanged.emit(this.filters);
         localStorage.setItem(`sfilters:${this.type}`, JSON.stringify(this.filters));
     }
@@ -316,6 +303,8 @@ export class ServerFilterComponent implements OnInit, OnChanges, OnDestroy {
     onSearchBlur() {
         setTimeout(() => {
             this.searchFocused = false;
+
+            this.cdr.markForCheck();
         }, 200);
     }
 
@@ -353,6 +342,6 @@ export class ServerFilterComponent implements OnInit, OnChanges, OnDestroy {
     }
 
     rentServer() {
-        this.gameService.openUrl('https://zap-hosting.com/fivem4');
+        this.gameService.openUrl('https://zap-hosting.com/fivemigcl');
     }
 }

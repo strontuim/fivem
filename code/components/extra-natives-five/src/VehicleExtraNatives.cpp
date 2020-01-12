@@ -6,6 +6,7 @@
 */
 
 #include "StdInc.h"
+#include "NativeWrappers.h"
 #include <ScriptEngine.h>
 #include <atArray.h>
 
@@ -20,11 +21,6 @@
 #include <MinHook.h>
 
 static std::unordered_set<fwEntity*> g_skipRepairVehicles{};
-
-static hook::cdecl_stub<fwEntity*(int handle)> getScriptEntity([]()
-{
-	return hook::pattern("44 8B C1 49 8B 41 08 41 C1 F8 08 41 38 0C 00").count(1).get(0).get<void>(-12);
-});
 
 template<typename T>
 inline static T readValue(fwEntity* ptr, int offset)
@@ -46,7 +42,7 @@ static fwEntity* getAndCheckVehicle(fx::ScriptContext& context)
 		return nullptr;
 	}
 
-	fwEntity* vehicle = getScriptEntity(context.GetArgument<int>(0));
+	fwEntity* vehicle = rage::fwScriptGuid::GetBaseFromGuid(context.GetArgument<int>(0));
 
 	if (!vehicle)
 	{
@@ -158,14 +154,17 @@ const int IsRightHeadLightBrokenOffset = 0x84C;
 const int EnginePowerMultiplierOffset = 0xAC0;
 const int CanWheelsBreakOffset = 0x923; // todo - check?
 const int BlinkerState = 0x929;
+const int WheelieState = 0x14F9;
+const int VehicleTypeOffset = 0xBA8;
+const int TrainTrackNodeIndex = 0x14C0;
 
 // Wheel class
 const int WheelXOffsetOffset = 0x030;
 const int WheelTyreRadiusOffset = 0x110;
 const int WheelRimRadiusOffset = 0x114;
 const int WheelTyreWidthOffset = 0x118;
-const int WheelRotationSpeedOffset = 0x168;
-const int WheelHealthOffset = 0x1E0;
+const int WheelRotationSpeedOffset = 0x170;
+const int WheelHealthOffset = 0x1E8; // 75 24 F3 0F 10 81 ? ? ? ? F3 0F
 const int WheelYRotOffset = 0x008;
 const int WheelInvYRotOffset = 0x010;
 
@@ -238,7 +237,7 @@ static HookFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_ENTITY_ROTATION_VELOCITY", [](fx::ScriptContext& context)
 	{
-		fwEntity* entity = getScriptEntity(context.GetArgument<int>(0));
+		fwEntity* entity = rage::fwScriptGuid::GetBaseFromGuid(context.GetArgument<int>(0));
 
 		if (!entity)
 		{
@@ -272,7 +271,7 @@ static HookFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_DASHBOARD_SPEED", readVehicleMemory<float, DashSpeedOffset>);
 
-	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_ACCELERATION", readVehicleMemory<float, AccelerationOffset>);
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_CURRENT_ACCELERATION", readVehicleMemory<float, AccelerationOffset>);
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_GRAVITY", readVehicleMemory<float, AccelerationOffset>);
 
@@ -451,6 +450,24 @@ static HookFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_INDICATOR_LIGHTS", readVehicleMemory<unsigned char, BlinkerState>);
 
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_WHEELIE_STATE", readVehicleMemory<unsigned char, WheelieState>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_WHEELIE_STATE", writeVehicleMemory<unsigned char, WheelieState>);
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_TRAIN_CURRENT_TRACK_NODE", [](fx::ScriptContext& context)
+	{
+		int trackNode = -1;
+
+		if (fwEntity* vehicle = getAndCheckVehicle(context))
+		{
+			if (readValue<int>(vehicle, VehicleTypeOffset) == 14) // is vehicle a train
+			{
+				trackNode = readValue<int>(vehicle, TrainTrackNodeIndex);
+			}
+		}
+
+		context.SetResult<int>(trackNode);
+	});
+
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_WHEEL_X_OFFSET", makeWheelFunction([](fx::ScriptContext& context, fwEntity* vehicle, uintptr_t wheelAddr)
 	{
 		context.SetResult<float>(*reinterpret_cast<float *>(wheelAddr + WheelXOffsetOffset));
@@ -513,6 +530,11 @@ static HookFunction initFunction([]()
 		static void CleanupVehicle(fwEntity* VehPointer)
 		{
 			g_skipRepairVehicles.erase(VehPointer);
+
+			// Delete the handling if it has been set to hooked.
+			void* handling = readValue<void*>(VehPointer, 0x918);
+			if (*((char*)handling + 28) == 1)
+				delete handling;
 		}
 		virtual void InternalMain() override
 		{
@@ -550,7 +572,7 @@ static HookFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_AUTO_REPAIR_DISABLED", [](fx::ScriptContext& context) {
 		auto vehHandle = context.GetArgument<int>(0);
 		auto shouldDisable = context.GetArgument<bool>(1);
-		fwEntity *entity = getScriptEntity(vehHandle);
+		fwEntity *entity = rage::fwScriptGuid::GetBaseFromGuid(vehHandle);
 		if (shouldDisable) {
 			g_skipRepairVehicles.insert(entity);
 		}
@@ -563,7 +585,7 @@ static HookFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("ADD_VEHICLE_DELETION_TRACE", [](fx::ScriptContext& context)
 	{
 		auto vehHandle = context.GetArgument<int>(0);
-		fwEntity* entity = getScriptEntity(vehHandle);
+		fwEntity* entity = rage::fwScriptGuid::GetBaseFromGuid(vehHandle);
 
 		if (entity->IsOfType<CVehicle>())
 		{
@@ -573,7 +595,7 @@ static HookFunction initFunction([]()
 	});
 
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("E8 ? ? ? ? 8A 83 DA 00 00 00 24 0F 3C 02", -0x31), DeleteVehicleWrap, (void**)&g_origDeleteVehicle);
+	MH_CreateHook(hook::get_pattern("E8 ? ? ? ? 8A 83 DA 00 00 00 24 0F 3C 02", -0x32), DeleteVehicleWrap, (void**)&g_origDeleteVehicle);
 	MH_CreateHook(hook::get_pattern("80 7A 4B 00 45 8A F9", -0x1D), DeleteNetworkCloneWrap, (void**)&g_origDeleteNetworkClone);
 	MH_EnableHook(MH_ALL_HOOKS);
 });

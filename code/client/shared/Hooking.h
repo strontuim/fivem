@@ -19,7 +19,7 @@
 namespace hook
 {
 // for link /DYNAMICBASE executables
-static ptrdiff_t baseAddressDifference;
+extern ptrdiff_t baseAddressDifference;
 
 // sets the base address difference based on an obtained pointer
 inline void set_base(uintptr_t address)
@@ -44,14 +44,32 @@ inline void set_base()
 template<typename T>
 inline void adjust_base(T& address)
 {
-	*(uintptr_t*)&address += baseAddressDifference;
+	if ((uintptr_t)address >= 0x140000000 && (uintptr_t)address <= 0x146000000)
+	{
+		*(uintptr_t*)& address += baseAddressDifference;
+	}
 }
 
 // returns the adjusted address to the stated base
 template<typename T>
 inline uintptr_t get_adjusted(T address)
 {
-	return (uintptr_t)address + baseAddressDifference;
+	if ((uintptr_t)address >= 0x140000000 && (uintptr_t)address <= 0x146000000)
+	{
+		return (uintptr_t)address + baseAddressDifference;
+	}
+
+	return (uintptr_t)address;
+}
+
+// returns the adjusted address to the stated base
+template<typename T>
+inline uintptr_t get_unadjusted(T address)
+{
+	if ((uintptr_t)address >= hook::get_adjusted(0x140000000) && (uintptr_t)address <= hook::get_adjusted(0x146000000))
+	{
+		return (uintptr_t)address - baseAddressDifference;
+	}
 }
 
 struct pass
@@ -139,7 +157,7 @@ inline T* getRVA(uintptr_t rva)
 #ifdef _M_IX86
 	return (T*)(baseAddressDifference + 0x400000 + rva);
 #elif defined(_M_AMD64)
-	return (T*)(0x140000000 + rva);
+	return (T*)(baseAddressDifference + 0x140000000 + rva);
 #endif
 }
 
@@ -586,6 +604,8 @@ public:
 #else
 void* AllocateFunctionStub(void* ptr, int type = 0);
 
+void* AllocateStubMemory(size_t size);
+
 template<typename T>
 struct get_func_ptr
 {
@@ -595,22 +615,25 @@ struct get_func_ptr
 	}
 };
 
+template<int Register, typename T, typename AT>
+inline std::enable_if_t<(Register < 8 && Register >= 0)> jump_reg(AT address, T func)
+{
+	LPVOID funcStub = AllocateFunctionStub(get_func_ptr<T>::get(func), Register);
+
+	put<uint8_t>(address, 0xE9);
+	put<int>((uintptr_t)address + 1, (intptr_t)funcStub - (intptr_t)get_adjusted(address) - 5);
+}
+
 template<typename T, typename AT>
 inline void jump(AT address, T func)
 {
-	LPVOID funcStub = AllocateFunctionStub(get_func_ptr<T>::get(func));
-
-	put<uint8_t>(address, 0xE9);
-	put<int>((uintptr_t)address + 1, (intptr_t)funcStub- (intptr_t)get_adjusted(address) - 5);
+	jump_reg<0>(address, func);
 }
 
 template<typename T, typename AT>
 inline void jump_rcx(AT address, T func)
 {
-	LPVOID funcStub = AllocateFunctionStub(get_func_ptr<T>::get(func), 1);
-
-	put<uint8_t>(address, 0xE9);
-	put<int>((uintptr_t)address + 1, (intptr_t)funcStub - (intptr_t)get_adjusted(address) - 5);
+	jump_reg<1>(address, func);
 }
 
 template<int Register, typename T, typename AT>

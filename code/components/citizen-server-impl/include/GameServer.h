@@ -9,7 +9,7 @@
 #include <MapComponent.h>
 #include <NetAddress.h>
 
-#include <nng.h>
+#include <nng/nng.h>
 
 #include <boost/bimap.hpp>
 
@@ -18,6 +18,11 @@
 #include <ServerTime.h>
 
 #include <GameServerNet.h>
+
+#include <UvLoopHolder.h>
+#include <UvTcpServer.h>
+
+#include <GameNames.h>
 
 namespace fx
 {
@@ -38,9 +43,13 @@ namespace fx
 
 		std::string GetVariable(const std::string& key);
 
-		void DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const fmt::ArgList& args);
+		void DropClientv(const std::shared_ptr<Client>& client, const std::string& reason, fmt::printf_args args);
 
-		FMT_VARIADIC(void, DropClient, const std::shared_ptr<Client>&, const std::string&);
+		template<typename... TArgs>
+		inline void DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const TArgs&... args)
+		{
+			DropClientv(client, reason, fmt::make_printf_args(args...));
+		}
 
 		void ForceHeartbeat();
 
@@ -70,42 +79,87 @@ namespace fx
 			return m_net->GetClientVersion();
 		}
 
-	public:
-		struct CallbackList
+		inline auto GetIpOverrideVar()
 		{
-			inline CallbackList(const std::string& socketName, int socketIdx)
+			return m_listingIpOverride;
+		}
+
+	public:
+		struct CallbackListBase
+		{
+			inline CallbackListBase()
+				: threadId(std::this_thread::get_id())
+			{
+
+			}
+
+			virtual ~CallbackListBase() = default;
+
+			inline void AttachToThread()
+			{
+				threadId = std::this_thread::get_id();
+			}
+
+			void Add(const std::function<void()>& fn, bool force = false);
+
+			void Run();
+
+		protected:
+			virtual void SignalThread() = 0;
+
+		private:
+			tbb::concurrent_queue<std::function<void()>> callbacks;
+
+			std::thread::id threadId;
+		};
+
+		struct CallbackListNng : public CallbackListBase
+		{
+			inline CallbackListNng(const std::string& socketName, int socketIdx)
 				: m_socketName(socketName), m_socketIdx(socketIdx)
 			{
 
 			}
 
-			void Add(const std::function<void()>& fn);
-
-			void Run();
+		protected:
+			virtual void SignalThread() override;
 
 		private:
-			tbb::concurrent_queue<std::function<void()>> callbacks;
-
 			std::string m_socketName;
 
 			int m_socketIdx;
 		};
 
-		inline void InternalAddMainThreadCb(const std::function<void()>& fn)
+		struct CallbackListUv : public CallbackListBase
 		{
-			m_mainThreadCallbacks.Add(fn);
+			inline CallbackListUv(std::weak_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> async)
+				: m_async(async)
+			{
+
+			}
+
+		protected:
+			virtual void SignalThread() override;
+
+		private:
+			std::weak_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> m_async;
+		};
+
+		inline void InternalAddMainThreadCb(const std::function<void()>& fn, bool force = false)
+		{
+			m_mainThreadCallbacks->Add(fn, force);
 		}
 
 		inline void InternalAddNetThreadCb(const std::function<void()>& fn)
 		{
-			m_netThreadCallbacks.Add(fn);
+			m_netThreadCallbacks->Add(fn);
 		}
 
 		fwRefContainer<NetPeerBase> InternalGetPeer(int peerId);
 
 		void InternalResetPeer(int peerId);
 
-		void InternalSendPacket(int peer, int channel, const net::Buffer& buffer, NetPacketType type);
+		void InternalSendPacket(const std::shared_ptr<fx::Client>& client, int peer, int channel, const net::Buffer& buffer, NetPacketType type);
 
 		void InternalRunMainThreadCbs(nng_socket socket);
 
@@ -122,6 +176,16 @@ namespace fx
 		{
 			m_packetHandler = handler;
 		}
+
+		inline fx::GameName GetGameName()
+		{
+			return m_gamename->GetValue();
+		}
+
+	private:
+		void InitializeNetUv();
+
+		void InitializeNetThread();
 
 	public:
 		fwEvent<> OnTick;
@@ -147,11 +211,19 @@ namespace fx
 
 		std::shared_ptr<ConsoleCommand> m_heartbeatCommand;
 
+		std::shared_ptr<ConVar<std::string>> m_listingIpOverride;
+
+		std::shared_ptr<ConVar<bool>> m_useDirectListing;
+
 		std::shared_ptr<ConVar<std::string>> m_rconPassword;
 
 		std::shared_ptr<ConVar<std::string>> m_hostname;
 
+		std::shared_ptr<ConVar<GameName>> m_gamename;
+
 		std::shared_ptr<ConVar<std::string>> m_masters[3];
+
+		std::string m_lastGameName;
 
 		tbb::concurrent_unordered_map<std::string, net::PeerAddress> m_masterCache;
 
@@ -163,15 +235,25 @@ namespace fx
 
 		fwRefContainer<GameServerNetBase> m_net;
 
+		fwRefContainer<net::UvLoopHolder> m_netThreadLoop;
+
+		fwRefContainer<net::UvLoopHolder> m_mainThreadLoop;
+
+		std::any m_netThreadData;
+
+		std::any m_mainThreadData;
+
 		std::function<bool(const uint8_t *, size_t, const net::PeerAddress &)> m_interceptor;
 
-		CallbackList m_mainThreadCallbacks{ "inproc://main_client", 0 };
+		std::unique_ptr<CallbackListBase> m_mainThreadCallbacks;
 
-		CallbackList m_netThreadCallbacks{ "inproc://netlib_client", 1 };
+		std::unique_ptr<CallbackListBase> m_netThreadCallbacks;
 	};
 
 	using TPacketTypeHandler = std::function<void(const std::shared_ptr<Client>& client, net::Buffer& packet)>;
 	using HandlerMapComponent = MapComponent<uint32_t, TPacketTypeHandler>;
+
+	bool IsBigMode();
 }
 
 DECLARE_INSTANCE_TYPE(fx::GameServer);

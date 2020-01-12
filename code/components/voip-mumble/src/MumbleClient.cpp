@@ -10,6 +10,10 @@
 #include <thread>
 #include <chrono>
 
+#include <json.hpp>
+
+using json = nlohmann::json;
+
 #include "PacketDataStream.h"
 
 static __declspec(thread) MumbleClient* g_currentMumbleClient;
@@ -22,6 +26,8 @@ inline std::chrono::milliseconds msec()
 void MumbleClient::Initialize()
 {
 	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+	m_voiceTarget = 0;
 
 	m_lastUdp = {};
 
@@ -109,6 +115,49 @@ void MumbleClient::SetOutputVolume(float volume)
 	return m_audioOutput.SetVolume(volume);
 }
 
+void MumbleClient::UpdateVoiceTarget(int idx, const VoiceTargetConfig& config)
+{
+	MumbleProto::VoiceTarget target;
+	target.set_id(idx);
+
+	for (auto& t : config.targets)
+	{
+		auto vt = target.add_targets();
+		
+		for (auto& userName : t.users)
+		{
+			m_state.ForAllUsers([this, &userName, &vt](const std::shared_ptr<MumbleUser>& user)
+			{
+				if (user->GetName() == ToWide(userName))
+				{
+					vt->add_session(user->GetSessionId());
+				}
+			});
+		}
+
+		if (!t.channel.empty())
+		{
+			for (auto& channelPair : m_state.GetChannels())
+			{
+				if (channelPair.second.GetName() == ToWide(t.channel))
+				{
+					vt->set_channel_id(channelPair.first);
+				}
+			}
+		}
+
+		vt->set_links(t.links);
+		vt->set_children(t.children);
+	}
+
+	Send(MumbleMessageType::VoiceTarget, target);
+}
+
+void MumbleClient::SetVoiceTarget(int idx)
+{
+	m_voiceTarget = idx;
+}
+
 void MumbleClient::SetChannel(const std::string& channelName)
 {
 	if (!m_connectionInfo.isConnected)
@@ -153,12 +202,29 @@ void MumbleClient::SetChannel(const std::string& channelName)
 
 void MumbleClient::SetAudioDistance(float distance)
 {
+	m_audioInput.SetDistance(distance);
 	m_audioOutput.SetDistance(distance);
+}
+
+void MumbleClient::SetPositionHook(const TPositionHook& hook)
+{
+	m_positionHook = hook;
 }
 
 float MumbleClient::GetInputAudioLevel()
 {
 	return m_audioInput.GetAudioLevel();
+}
+
+void MumbleClient::SetClientVolumeOverride(const std::string& clientName, float volume)
+{
+	m_state.ForAllUsers([this, &clientName, volume](const std::shared_ptr<MumbleUser>& user)
+	{
+		if (user->GetName() == ToWide(clientName))
+		{
+			GetOutput().HandleClientVolumeOverride(*user, volume);
+		}
+	});
 }
 
 void MumbleClient::GetTalkers(std::vector<std::string>* referenceIds)
@@ -172,7 +238,10 @@ void MumbleClient::GetTalkers(std::vector<std::string>* referenceIds)
 	{
 		auto user = m_state.GetUser(session);
 
-		referenceIds->push_back(ToNarrow(user->GetName()));
+		if (user)
+		{
+			referenceIds->push_back(ToNarrow(user->GetName()));
+		}
 	}
 
 	// local talker talking?
@@ -251,6 +320,10 @@ void MumbleClient::HandleUDP(const uint8_t* buf, size_t size)
 		return;
 	}
 
+	// update UDP timestamp
+	m_lastUdp = msec();
+
+	// handle voice packet
 	HandleVoice(outBuf, size - 4);
 }
 
@@ -368,12 +441,30 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 
 	if (pds.left() >= 12)
 	{
-		float pos[3];
+		std::array<float, 3> pos;
 		pds >> pos[0];
 		pds >> pos[1];
 		pds >> pos[2];
 
-		this->GetOutput().HandleClientPosition(*user, pos);
+		if (m_positionHook)
+		{
+			auto newPos = m_positionHook(ToNarrow(user->GetName()));
+
+			if (newPos)
+			{
+				pos = *newPos;
+			}
+		}
+
+		if (pds.left() >= 4)
+		{
+			float distance;
+			pds >> distance;
+
+			this->GetOutput().HandleClientDistance(*user, distance);
+		}
+
+		this->GetOutput().HandleClientPosition(*user, pos.data());
 	}
 
 	printf("\n");
@@ -421,6 +512,10 @@ void MumbleClient::ThreadFuncImpl()
 
 					bind(m_udpSocket, (sockaddr*)&sn, sizeof(sn));
 
+					m_state.Reset();
+					m_state.SetClient(this);
+					m_state.SetUsername(ToWide(m_connectionInfo.username));
+
 					trace("[mumble] connecting to %s...\n", address.ToString());
 
 					break;
@@ -433,10 +528,16 @@ void MumbleClient::ThreadFuncImpl()
 
 					if (events.iErrorCode[FD_CONNECT_BIT])
 					{
-						// TODO: reconnecting?
 						trace("[mumble] connecting failed: %d\n", events.iErrorCode[FD_CONNECT_BIT]);
 
-						m_completionEvent.set_exception(std::runtime_error("Failed Mumble connection."));
+						//m_completionEvent.set_exception(std::runtime_error("Failed Mumble connection."));
+
+						LARGE_INTEGER waitTime;
+						waitTime.QuadPart = -20000000LL; // 2s
+
+						SetWaitableTimer(m_idleEvent, &waitTime, 0, nullptr, nullptr, 0);
+
+						m_connectionInfo.isConnected = false;
 
 						break;
 					}
@@ -444,14 +545,9 @@ void MumbleClient::ThreadFuncImpl()
 					WSACloseEvent(m_socketConnectEvent);
 					m_socketConnectEvent = INVALID_HANDLE_VALUE;
 
-					LARGE_INTEGER waitTime;
-					waitTime.QuadPart = -5000000LL; // 500ms
-
-					SetWaitableTimer(m_idleEvent, &waitTime, 0, nullptr, nullptr, 0);
-
 					m_handler.Reset();
 
-					WSAEventSelect(m_socket, m_socketReadEvent, FD_READ);
+					WSAEventSelect(m_socket, m_socketReadEvent, FD_READ | FD_CLOSE);
 					WSAEventSelect(m_udpSocket, m_udpReadEvent, FD_READ);
 
 					m_sessionManager = std::make_unique<Botan::TLS::Session_Manager_In_Memory>(m_rng);
@@ -473,7 +569,7 @@ void MumbleClient::ThreadFuncImpl()
 
 				case ClientTask::Idle:
 				{
-					if (m_tlsClient->is_active() && m_connectionInfo.isConnected)
+					if (m_tlsClient && m_tlsClient->is_active() && m_connectionInfo.isConnected)
 					{
 						{
 							MumbleProto::Ping ping;
@@ -504,6 +600,12 @@ void MumbleClient::ThreadFuncImpl()
 
 						SetWaitableTimer(m_idleEvent, &waitTime, 0, nullptr, nullptr, 0);
 					}
+					else
+					{
+						trace("[mumble] reconnecting!\n");
+
+						SetEvent(m_beginConnectEvent);
+					}
 
 					break;
 				}
@@ -512,6 +614,21 @@ void MumbleClient::ThreadFuncImpl()
 				{
 					WSANETWORKEVENTS ne;
 					WSAEnumNetworkEvents(m_socket, m_socketReadEvent, &ne);
+
+					if (ne.lNetworkEvents & FD_CLOSE)
+					{
+						// TCP close, graceful?
+						trace("[mumble] socket close :(\n");
+
+						// try to reconnect
+						closesocket(m_socket);
+
+						SetEvent(m_beginConnectEvent);
+
+						m_connectionInfo.isConnected = false;
+
+						break;
+					}
 
 					uint8_t buffer[16384];
 					int len = recv(m_socket, (char*)buffer, sizeof(buffer), 0);
@@ -530,6 +647,8 @@ void MumbleClient::ThreadFuncImpl()
 						closesocket(m_socket);
 
 						SetEvent(m_beginConnectEvent);
+
+						m_connectionInfo.isConnected = false;
 					}
 					else
 					{
@@ -542,6 +661,8 @@ void MumbleClient::ThreadFuncImpl()
 							closesocket(m_socket);
 
 							SetEvent(m_beginConnectEvent);
+
+							m_connectionInfo.isConnected = false;
 						}
 					}
 
@@ -672,11 +793,13 @@ void MumbleClient::OnAlert(Botan::TLS::Alert alert, const uint8_t[], size_t)
 {
 	trace("[mumble] TLS alert: %s\n", alert.type_string().c_str());
 
-	if (alert.is_fatal())
+	if (alert.is_fatal() || alert.type() == Botan::TLS::Alert::CLOSE_NOTIFY)
 	{
 		closesocket(m_socket);
 
 		m_connectionInfo.isConnected = false;
+
+		SetEvent(m_beginConnectEvent);
 	}
 }
 
@@ -696,6 +819,14 @@ bool MumbleClient::OnHandshake(const Botan::TLS::Session& session)
 
 void MumbleClient::OnActivated()
 {
+	// initialize idle timer only *now* that the session is active
+	// (otherwise, if the idle timer ran after 500ms from connecting, but TLS connection wasn't set up within those 500ms,
+	// the idle event would immediately try to reconnect)
+	LARGE_INTEGER waitTime;
+	waitTime.QuadPart = -5000000LL; // 500ms
+
+	SetWaitableTimer(m_idleEvent, &waitTime, 0, nullptr, nullptr, 0);
+
 	// send our own version
 	MumbleProto::Version ourVersion;
 	ourVersion.set_version(0x00010204);

@@ -29,6 +29,7 @@ public:
 	std::thread thread;
 	tbb::concurrent_queue<CURL*> handlesToAdd;
 	tbb::concurrent_queue<std::function<void()>> cbsToRun;
+	HttpClient* client;
 
 	HttpClientImpl()
 		: multi(nullptr), shouldRun(true)
@@ -61,6 +62,8 @@ public:
 	int weight;
 	HttpHeaderListPtr responseHeaders;
 	std::shared_ptr<int> responseCode;
+	std::chrono::milliseconds timeoutNoResponse;
+	std::chrono::high_resolution_clock::duration reqStart;
 
 	CurlData();
 
@@ -71,6 +74,9 @@ public:
 
 CurlData::CurlData()
 {
+	timeoutNoResponse = std::chrono::milliseconds(0);
+	reqStart = std::chrono::high_resolution_clock::duration(0);
+
 	writeFunction = [=] (const void* data, size_t size)
 	{
 		ss << std::string((const char*)data, size);
@@ -124,6 +130,7 @@ void CurlData::HandleResult(CURL* handle, CURLcode result)
 HttpClient::HttpClient(const wchar_t* userAgent /* = L"CitizenFX/1" */)
 	: m_impl(new HttpClientImpl())
 {
+	m_impl->client = this;
 	m_impl->multi = curl_multi_init();
 	curl_multi_setopt(m_impl->multi, CURLMOPT_PIPELINING, CURLPIPE_HTTP1 | CURLPIPE_MULTIPLEX);
 	curl_multi_setopt(m_impl->multi, CURLMOPT_MAX_HOST_CONNECTIONS, 8);
@@ -188,12 +195,13 @@ HttpClient::HttpClient(const wchar_t* userAgent /* = L"CitizenFX/1" */)
 
 						auto data = reinterpret_cast<std::shared_ptr<CurlData>*>(dataPtr);
 						(*data)->HandleResult(curl, result);
-						(*data)->curlHandle = nullptr;
-
-						delete data;
 
 						curl_multi_remove_handle(m_impl->multi, curl);
 						curl_easy_cleanup(curl);
+
+						// delete data
+						(*data)->curlHandle = nullptr;
+						delete data;
 					}
 				} while (msg);
 
@@ -268,6 +276,28 @@ static int CurlXferInfo(void *userdata, curl_off_t dltotal, curl_off_t dlnow, cu
 		cd->progressCallback(info);
 	}
 
+	using namespace std::chrono_literals;
+
+	if (cd->timeoutNoResponse != 0ms)
+	{
+		// first progress callback is the start of the timeout
+		// if we do this any earlier, we run the risk of having concurrent connections that
+		// are throttled due to max-connection limit time out instantly
+		if (cd->reqStart.count() == 0)
+		{
+			cd->reqStart = std::chrono::high_resolution_clock::now().time_since_epoch();
+		}
+
+		if (dlnow == 0 && dltotal == 0)
+		{
+			if (std::chrono::high_resolution_clock::now().time_since_epoch() - cd->reqStart > cd->timeoutNoResponse)
+			{
+				// abort due to timeout
+				return 1;
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -310,6 +340,7 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 	curlData->defaultWeight = curlData->weight = options.weight;
 	curlData->responseHeaders = options.responseHeaders;
 	curlData->responseCode = options.responseCode;
+	curlData->timeoutNoResponse = options.timeoutNoResponse;
 
 	auto scb = options.streamingCallback;
 
@@ -352,6 +383,13 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 	}
 
 	curl_easy_setopt(curlHandle, CURLOPT_HTTPHEADER, headers);
+
+	if (options.ipv4)
+	{
+		curl_easy_setopt(curlHandle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+	}
+
+	impl->client->OnSetupCurlHandle(curlHandle, url);
 
 	return { curlHandle, curlData };
 }
@@ -417,13 +455,15 @@ public:
 			curl_easy_getinfo(curl, CURLINFO_PRIVATE, &dataPtr);
 
 			auto data = reinterpret_cast<std::shared_ptr<CurlData>*>(dataPtr);
-			(*data)->curlHandle = nullptr;
-
-			delete data;
 
 			// remove and delete the handle
 			curl_multi_remove_handle(impl->multi, curl);
 			curl_easy_cleanup(curl);
+
+			// delete cURL data
+			(*data)->curlHandle = nullptr;
+
+			delete data;
 		});
 	}
 };
